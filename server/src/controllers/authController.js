@@ -20,40 +20,16 @@ const userResponse = (user, token) => ({
   ...(token && { token }),
 });
 
-// ─── Register (internal — owner/admin create accounts) ───────────────────────
-// @route  POST /api/auth/register
-// @access Private (owner, admin) — see notes below
-export const register = async (req, res) => {
-  const { name, email, password, role, branch, departments, phone } = req.body;
-
-  const existingUser = await User.findOne({ email });
-  if (existingUser) {
-    return res.status(400).json({ message: 'A user already exists with that email' });
-  }
-
-  const user = await User.create({
-    name,
-    email,
-    password,
-    role: role || 'parent',
-    branch: branch || null,
-    departments: departments || [],
-    phone: phone || '',
-    createdBy: req.user?._id || null,
-  });
-
-  const populated = await User.findById(user._id).populate('branch', 'name code city');
-
-  res.status(201).json(userResponse(populated, generateToken(user._id)));
-};
-
 // ─── Login ────────────────────────────────────────────────────────────────────
 // @route  POST /api/auth/login
 // @access Public
 export const login = async (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Please enter your email and password' });
+  }
 
-  const user = await User.findOne({ email })
+  const user = await User.findOne({ email: email.toLowerCase().trim() })
     .select('+password')
     .populate('branch', 'name code city isActive');
 
@@ -62,11 +38,15 @@ export const login = async (req, res) => {
   }
 
   if (!user.isActive) {
-    return res.status(403).json({ message: 'Your account has been deactivated. Please contact the clinic.' });
+    return res
+      .status(403)
+      .json({ message: 'Your account has been deactivated. Please contact the clinic.' });
   }
 
   if (user.branch && !user.branch.isActive) {
-    return res.status(403).json({ message: 'Your branch is currently inactive. Please contact the clinic owner.' });
+    return res
+      .status(403)
+      .json({ message: 'Your branch is currently inactive. Please contact the clinic owner.' });
   }
 
   res.json(userResponse(user, generateToken(user._id)));
@@ -85,6 +65,10 @@ export const getMe = async (req, res) => {
 // @access Private
 export const changePassword = async (req, res) => {
   const { currentPassword, newPassword } = req.body;
+
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ message: 'New password must be at least 6 characters' });
+  }
 
   const user = await User.findById(req.user._id).select('+password');
   if (!user || !(await user.matchPassword(currentPassword))) {

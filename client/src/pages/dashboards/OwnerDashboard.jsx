@@ -1,215 +1,230 @@
-import { useState, useEffect } from 'react';
-import DashboardLayout from '../../components/DashboardLayout';
+import { Link, useNavigate } from 'react-router-dom';
+import {
+  Building2,
+  Baby,
+  CalendarDays,
+  Wallet,
+  Plus,
+  UserPlus,
+  ChevronRight,
+  BarChart3,
+} from 'lucide-react';
+import {
+  PageHeader,
+  Card,
+  CardHeader,
+  Stat,
+  Badge,
+  Progress,
+  EmptyState,
+  SkeletonRows,
+  Alert,
+} from '../../components/ui';
+import { useAuth } from '../../context/AuthContext';
+import { useApi } from '../../hooks/useApi';
 import { branchApi } from '../../api/branches';
 import { patientsApi } from '../../api/patients';
-import { appointmentsApi } from '../../api/appointments';
-import { usersApi } from '../../api/users';
-import { getDeptLabel, getDeptColor, APPOINTMENT_STATUSES } from '../../utils/constants';
-import { Link } from 'react-router-dom';
+import { billingApi } from '../../api/billing';
+import { getDeptName } from '../../utils/constants';
+import { formatCurrency, formatLongDate, greeting, firstName, pct } from '../../utils/format';
+import { cleanName } from './shared/helpers';
 
 const OwnerDashboard = () => {
-  const [branches, setBranches] = useState([]);
-  const [stats, setStats] = useState({ patients: 0, active: 0, therapists: 0, todayAppts: 0 });
-  const [deptStats, setDeptStats] = useState([]);
-  const [todayAppts, setTodayAppts] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const { user } = useAuth();
+  const navigate = useNavigate();
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const [branchRes, patientStatsRes, therapistsRes, todayRes] = await Promise.all([
-          branchApi.getAll(),
-          patientsApi.getStats(),
-          usersApi.getAll({ role: 'therapist' }),
-          appointmentsApi.getToday(),
-        ]);
-        setBranches(branchRes.data);
-        setStats({
-          patients: patientStatsRes.data.total,
-          active: patientStatsRes.data.active,
-          therapists: therapistsRes.data.length,
-          todayAppts: todayRes.data.length,
-        });
-        setDeptStats(patientStatsRes.data.byDepartment || []);
-        setTodayAppts(todayRes.data.slice(0, 5));
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, []);
+  const { data, loading, error } = useApi(async () => {
+    const [overview, stats, billing] = await Promise.all([
+      branchApi.getOverview(),
+      patientsApi.getStats(),
+      billingApi.getSummary(),
+    ]);
+    return { overview: overview.data, stats: stats.data, billing: billing.data };
+  });
 
-  if (loading) return (
-    <DashboardLayout>
-      <div className="loading-screen">
-        <div className="spinner spinner-lg"></div>
-        <p>Loading overview data...</p>
-      </div>
-    </DashboardLayout>
-  );
+  const rows = data?.overview || [];
+  const sum = (k) => rows.reduce((n, r) => n + r[k], 0);
+  const todayTotal = sum('todaySessions');
+  const todayDone = sum('todayCompleted');
+  const depts = (data?.stats.byDepartment || []).slice(0, 8);
+  const maxDept = Math.max(1, ...depts.map((d) => d.count));
 
   return (
-    <DashboardLayout>
-      {/* Header */}
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Clinic Overview</h1>
-          <p className="page-subtitle">Monitor all branches and high-level metrics across your therapy network.</p>
-        </div>
-        <div className="flex gap-2">
-          <Link to="/dashboard/staff" className="btn btn-secondary">
-            👥 Staff Directory
-          </Link>
-          <Link to="/dashboard/branches" className="btn btn-primary">
-            + New Branch
-          </Link>
-        </div>
+    <>
+      <PageHeader
+        title="Overview"
+        description={`${greeting()}, ${firstName(cleanName(user.name))} · ${formatLongDate(new Date())}`}
+        actions={
+          <>
+            <Link to="/dashboard/staff?add=1" className="btn btn-secondary">
+              <UserPlus size={16} /> Add staff
+            </Link>
+            <Link to="/dashboard/branches?add=1" className="btn btn-primary">
+              <Plus size={16} /> New branch
+            </Link>
+          </>
+        }
+      />
+
+      {error && (
+        <Alert tone="danger" className="mb-4">
+          {error}
+        </Alert>
+      )}
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <Stat
+          label="Branches"
+          icon={Building2}
+          value={loading ? '–' : rows.filter((r) => r.branch.isActive).length}
+          hint={`${rows.length} in network`}
+        />
+        <Stat
+          label="Active children"
+          icon={Baby}
+          value={data ? data.stats.active : '–'}
+          hint={data && `${data.stats.onHold} on hold · ${data.stats.discharged} discharged`}
+        />
+        <Stat
+          label="Sessions today"
+          icon={CalendarDays}
+          value={loading ? '–' : todayTotal}
+          hint={`${todayDone} attended so far`}
+        >
+          <Progress value={pct(todayDone, todayTotal)} className="mt-2" />
+        </Stat>
+        <Stat
+          label="Fees this month"
+          icon={Wallet}
+          accent="var(--success)"
+          value={data ? formatCurrency(data.billing.collected.total) : '–'}
+          hint={data && `${formatCurrency(data.billing.pending.total)} still due`}
+        />
       </div>
 
-      {/* Stats */}
-      <div className="stats-grid">
-        {[
-          { icon: '🏢', label: 'Total Branches', value: branches.length, color: 'var(--primary)' },
-          { icon: '👶', label: 'Active Patients', value: stats.active, color: 'var(--success)' },
-          { icon: '💊', label: 'Therapists', value: stats.therapists, color: 'var(--violet)' },
-          { icon: '📅', label: "Today's Sessions", value: stats.todayAppts, color: 'var(--warning)' },
-        ].map((s) => (
-          <div key={s.label} className="stat-card" style={{ '--stat-color': s.color }}>
-            <div className="stat-card-top">
-              <div className="stat-icon" style={{ background: `${s.color}22`, color: s.color }}>{s.icon}</div>
-              <span className="stat-trend" style={{ background: `${s.color}15`, color: s.color }}>View →</span>
-            </div>
-            <div>
-              <div className="stat-value">{s.value}</div>
-              <div className="stat-label">{s.label}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="grid-2">
-        {/* Branches table */}
-        <div className="card" style={{ gridColumn: '1 / -1' }}>
-          <div className="card-header">
-            <h2 className="section-title">Branch Performance</h2>
-            <Link to="/dashboard/branches" className="btn btn-secondary btn-sm">Manage Branches</Link>
-          </div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Branch Name</th>
-                  <th>Location</th>
-                  <th>Code</th>
-                  <th>Capacity</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {branches.length === 0 ? (
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+        <Card>
+          <CardHeader
+            title="Branches"
+            description="Today and this month at a glance"
+            actions={
+              <Link to="/dashboard/branches" className="btn btn-ghost btn-sm">
+                Manage <ChevronRight size={14} />
+              </Link>
+            }
+          />
+          {loading ? (
+            <SkeletonRows rows={5} />
+          ) : rows.length === 0 ? (
+            <EmptyState
+              icon={Building2}
+              title="No branches yet"
+              description="Create your first branch to start adding staff and children."
+              action={
+                <Link to="/dashboard/branches?add=1" className="btn btn-primary btn-sm">
+                  <Plus size={15} /> New branch
+                </Link>
+              }
+            />
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
                   <tr>
-                    <td colSpan={5}>
-                      <div className="empty-state">
-                        <div className="empty-icon">🏥</div>
-                        <div className="empty-title">No branches registered</div>
-                        <div className="empty-desc">Create your first branch to start managing operations.</div>
-                      </div>
-                    </td>
+                    <th>Branch</th>
+                    <th className="col-right">Children</th>
+                    <th className="col-right">Therapists</th>
+                    <th>Today</th>
+                    <th className="col-right">Fees (month)</th>
                   </tr>
-                ) : branches.map((b) => (
-                  <tr key={b._id}>
-                    <td>
-                      <div className="font-semibold text-primary">{b.name}</div>
-                      <div className="text-xs text-muted mt-1">{b.email}</div>
-                    </td>
-                    <td>{b.city}</td>
-                    <td><span className="badge" style={{ background: 'var(--surface-3)', color: 'var(--text-secondary)' }}>{b.code}</span></td>
-                    <td>{b.departments?.length || 0} Departments</td>
-                    <td>
-                      <span className="badge" style={{ 
-                        background: b.isActive ? 'var(--success-bg)' : 'var(--error-bg)', 
-                        color: b.isActive ? 'var(--success)' : 'var(--error)',
-                        borderColor: b.isActive ? '#bbf7d0' : '#fecaca'
-                      }}>
-                        {b.isActive ? 'Active' : 'Inactive'}
-                      </span>
-                    </td>
-                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr
+                      key={r.branch._id}
+                      className="row-link"
+                      onClick={() => navigate(`/dashboard/branches?open=${r.branch._id}`)}
+                    >
+                      <td>
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium text-fg">{r.branch.name}</span>
+                          {!r.branch.isActive && <Badge tone="gray">Inactive</Badge>}
+                        </div>
+                        <div className="text-xs text-muted">
+                          <span className="mono-tag">{r.branch.code}</span> {r.branch.city}
+                        </div>
+                      </td>
+                      <td className="col-right tnum">{r.activePatients}</td>
+                      <td className="col-right tnum">
+                        {r.clinicians}
+                        {r.admins === 0 && <div className="text-xs text-warning">No admin</div>}
+                      </td>
+                      <td className="min-w-[140px]">
+                        <div className="flex items-center gap-2 text-sm tnum">
+                          <span className="text-fg">
+                            {r.todayCompleted}/{r.todaySessions}
+                          </span>
+                          <Progress
+                            value={pct(r.todayCompleted, r.todaySessions)}
+                            className="flex-1"
+                          />
+                        </div>
+                      </td>
+                      <td className="col-right tnum">{formatCurrency(r.monthRevenue)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <div className="space-y-6">
+          <Card>
+            <CardHeader
+              title="Children by therapy"
+              description="Active enrolments across the network"
+            />
+            {loading ? (
+              <SkeletonRows rows={4} />
+            ) : depts.length === 0 ? (
+              <EmptyState icon={BarChart3} title="No enrolments yet" />
+            ) : (
+              <div className="card-body space-y-3">
+                {depts.map((d) => (
+                  <div key={d._id} title={`${getDeptName(d._id)}: ${d.count}`}>
+                    <div className="flex justify-between text-sm mb-1">
+                      <span className="text-fg-2 truncate-1">{getDeptName(d._id)}</span>
+                      <span className="text-fg font-medium tnum">{d.count}</span>
+                    </div>
+                    <div className="h-2 rounded bg-surface-3 overflow-hidden">
+                      <div
+                        className="h-full rounded bg-primary"
+                        style={{ width: `${(d.count / maxDept) * 100}%` }}
+                      />
+                    </div>
+                  </div>
                 ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+              </div>
+            )}
+          </Card>
 
-        {/* Dept distribution */}
-        <div className="card">
-          <div className="card-header">
-            <h2 className="section-title">Department Utilization</h2>
-          </div>
-          {deptStats.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-icon">📊</div>
-              <div className="empty-title">No data available</div>
-            </div>
-          ) : (
-            <div className="flex" style={{ flexDirection: 'column', gap: '1rem' }}>
-              {deptStats.map((d) => {
-                const max = deptStats[0]?.count || 1;
-                const pct = Math.round((d.count / max) * 100);
-                return (
-                  <div key={d._id}>
-                    <div className="flex justify-between items-center mb-1 text-sm">
-                      <span className="font-semibold text-secondary">{getDeptLabel(d._id)}</span>
-                      <span className="font-bold" style={{ color: getDeptColor(d._id) }}>{d.count} Patients</span>
-                    </div>
-                    <div className="progress-bar">
-                      <div className="progress-fill" style={{ width: `${pct}%`, background: getDeptColor(d._id) }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Today's appointments */}
-        <div className="card">
-          <div className="card-header">
-            <h2 className="section-title">Live Session Feed (All Branches)</h2>
-          </div>
-          {todayAppts.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-icon">📅</div>
-              <div className="empty-title">No sessions today</div>
-            </div>
-          ) : (
-            <div className="timeline" style={{ paddingLeft: '0.5rem' }}>
-              {todayAppts.map((a) => (
-                <div key={a._id} className="timeline-item">
-                  <div className="timeline-dot" style={{ borderColor: getDeptColor(a.department) }} />
-                  <div className="flex-1" style={{ marginTop: '-4px' }}>
-                    <div className="flex justify-between items-center">
-                      <div className="font-semibold text-primary">{a.patient?.name}</div>
-                      <span className="badge" style={{ background: `${APPOINTMENT_STATUSES[a.status]?.color}15`, color: APPOINTMENT_STATUSES[a.status]?.color }}>
-                        {APPOINTMENT_STATUSES[a.status]?.label}
-                      </span>
-                    </div>
-                    <div className="text-sm text-secondary mt-1">
-                      {a.timeSlot} • Dr. {a.therapist?.name}
-                    </div>
-                    <div className="text-xs text-muted mt-1">
-                      {getDeptLabel(a.department)} • {a.branch?.code}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+          <Link
+            to="/dashboard/reports"
+            className="card flex items-center gap-3 p-4 hover:bg-surface-2 transition-colors"
+          >
+            <BarChart3 size={18} className="text-primary" />
+            <span className="flex-1">
+              <span className="block font-medium text-fg">Reports</span>
+              <span className="block text-sm text-muted">
+                Attendance, therapist activity and fees by branch
+              </span>
+            </span>
+            <ChevronRight size={16} className="text-muted" />
+          </Link>
         </div>
       </div>
-    </DashboardLayout>
+    </>
   );
 };
 

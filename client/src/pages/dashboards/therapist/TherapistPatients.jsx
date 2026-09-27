@@ -1,297 +1,244 @@
-import { useState, useEffect } from 'react';
-import DashboardLayout from '../../../components/DashboardLayout';
+import { useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { Baby, CalendarDays, History, NotebookPen, CalendarPlus } from 'lucide-react';
+import {
+  PageHeader,
+  Card,
+  Tabs,
+  SearchInput,
+  Avatar,
+  DeptChips,
+  PatientStatus,
+  EmptyState,
+  SkeletonRows,
+  Alert,
+  Badge,
+} from '../../../components/ui';
 import { useAuth } from '../../../context/AuthContext';
+import { useApi } from '../../../hooks/useApi';
 import { patientsApi } from '../../../api/patients';
 import { appointmentsApi } from '../../../api/appointments';
-import { getDeptLabel, getDeptColor, PATIENT_STATUSES } from '../../../utils/constants';
-import PatientDossierDrawer from './PatientDossierDrawer';
-import ScheduleSessionModal from './ScheduleSessionModal';
-import SessionNotesModal from './SessionNotesModal';
+import { getDeptName } from '../../../utils/constants';
+import {
+  toDateKey,
+  formatRelativeDay,
+  formatDate,
+  formatClock,
+  slotStart,
+} from '../../../utils/format';
+import PatientDrawer from '../shared/PatientDrawer';
+import BookSessionModal from '../shared/BookSessionModal';
+import { needsNotes } from '../shared/helpers';
 
 const TherapistPatients = () => {
   const { user } = useAuth();
-  const [patients, setPatients] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const isTeacher = user.role === 'teacher';
+  const noun = isTeacher ? 'students' : 'children';
+  const [params, setParams] = useSearchParams();
+  const [status, setStatus] = useState('active');
   const [search, setSearch] = useState('');
-  const [departmentFilter, setDepartmentFilter] = useState('');
-  const [statusFilter, setStatusFilter] = useState('active');
+  const [dept, setDept] = useState('');
+  const [booking, setBooking] = useState(null);
 
-  // Modals / Drawers
-  const [selectedPatientForDossier, setSelectedPatientForDossier] = useState(null);
-  const [schedulingPatient, setSchedulingPatient] = useState(null);
-  const [editingAppointment, setEditingAppointment] = useState(null);
-
-  const loadPatients = async () => {
-    try {
-      const res = await patientsApi.getAll({
-        search: search || undefined,
-        department: departmentFilter || undefined,
-        status: statusFilter === 'all' ? undefined : statusFilter,
-      });
-      setPatients(res.data);
-    } catch (err) {
-      console.error('Failed to load therapist patients', err);
-    } finally {
-      setLoading(false);
-    }
+  const openId = params.get('open');
+  const setOpen = (id) => {
+    const next = new URLSearchParams(params);
+    if (id) next.set('open', id);
+    else next.delete('open');
+    setParams(next, { replace: true });
   };
 
-  useEffect(() => {
-    loadPatients();
-  }, [departmentFilter, statusFilter]);
+  const { data, loading, error, reload } = useApi(async () => {
+    const [patients, sessions] = await Promise.all([
+      patientsApi.getAll(),
+      appointmentsApi.getAll(),
+    ]);
+    return { patients: patients.data, sessions: sessions.data };
+  });
 
-  // Handle search with debounce
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      loadPatients();
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [search]);
+  // Next / last session and outstanding notes for each child (from my own sessions)
+  const activity = useMemo(() => {
+    const today = toDateKey();
+    const map = {};
+    (data?.sessions || []).forEach((s) => {
+      const id = s.patient?._id;
+      if (!id) return;
+      const a = (map[id] ||= { next: null, last: null, toWrite: 0 });
+      const key = toDateKey(s.date);
+      if (s.status === 'scheduled' && key >= today && (!a.next || key < toDateKey(a.next.date)))
+        a.next = s;
+      if (s.status === 'completed' && (!a.last || key > toDateKey(a.last.date))) a.last = s;
+      if (needsNotes(s)) a.toWrite += 1;
+    });
+    return map;
+  }, [data]);
 
-  const handleSaveNotes = async (id, data) => {
-    await appointmentsApi.addNotes(id, data);
-    // Reload patient dossier if open
-    if (selectedPatientForDossier) {
-      const updatedP = await patientsApi.getOne(selectedPatientForDossier._id);
-      setSelectedPatientForDossier(updatedP.data);
-    }
-  };
+  const all = data?.patients || [];
+  const shown = all.filter((p) => {
+    if (status !== 'all' && p.status !== status) return false;
+    if (dept && !p.enrolledDepartments?.includes(dept)) return false;
+    const q = search.trim().toLowerCase();
+    return (
+      !q ||
+      [p.name, p.studentId, p.diagnosis, p.parentDetails?.name].some((v) =>
+        v?.toLowerCase().includes(q)
+      )
+    );
+  });
 
   return (
-    <DashboardLayout>
-      {/* Patient Dossier Drawer */}
-      {selectedPatientForDossier && (
-        <PatientDossierDrawer
-          patient={selectedPatientForDossier}
-          onClose={() => setSelectedPatientForDossier(null)}
-          onScheduleSession={(p) => setSchedulingPatient(p)}
-          onEditNotes={(appt) => setEditingAppointment(appt)}
-        />
+    <>
+      <PageHeader
+        title={isTeacher ? 'Students' : 'Patients'}
+        description={`The ${noun} on your caseload — open one for their history, family contact and to write notes`}
+      />
+
+      {error && (
+        <Alert tone="danger" className="mb-4">
+          {error}
+        </Alert>
       )}
 
-      {/* Schedule Follow-up Session Modal */}
-      {schedulingPatient && (
-        <ScheduleSessionModal
-          patients={patients}
-          therapist={user}
-          onClose={() => setSchedulingPatient(null)}
-          onScheduled={() => {
-            loadPatients();
-          }}
-        />
-      )}
-
-      {/* Edit Session Notes Modal (when triggered from dossier) */}
-      {editingAppointment && (
-        <SessionNotesModal
-          appointment={editingAppointment}
-          onClose={() => setEditingAppointment(null)}
-          onSave={handleSaveNotes}
-        />
-      )}
-
-      {/* Header */}
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Patient Caseload &amp; Dossiers</h1>
-          <p className="page-subtitle">
-            Clinical profiles, medical backgrounds, and therapy progress for your assigned children.
-          </p>
-        </div>
-        <button
-          className="btn btn-primary"
-          onClick={() => setSchedulingPatient(patients[0] || true)}
-          disabled={patients.length === 0}
-        >
-          + Schedule New Session
-        </button>
-      </div>
-
-      {/* Filter and Search Bar */}
-      <div className="card mb-4" style={{ padding: '1rem' }}>
-        <div className="flex gap-3 flex-wrap items-center">
-          {/* Search */}
-          <div className="flex-1" style={{ minWidth: 240 }}>
-            <input
-              type="text"
-              className="input"
-              placeholder="🔍 Search child by name..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-          </div>
-
-          {/* Department filter */}
-          <div style={{ minWidth: 180 }}>
+      <Card className="mb-4">
+        <div className="flex flex-wrap items-center gap-2 p-3">
+          <Tabs
+            value={status}
+            onChange={setStatus}
+            tabs={[
+              {
+                value: 'active',
+                label: 'Active',
+                count: all.filter((p) => p.status === 'active').length,
+              },
+              { value: 'all', label: 'All', count: all.length },
+            ]}
+          />
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder={`Search ${noun}…`}
+            className="flex-1 min-w-[200px]"
+          />
+          {user.departments?.length > 1 && (
             <select
-              className="select"
-              value={departmentFilter}
-              onChange={(e) => setDepartmentFilter(e.target.value)}
+              className="select w-auto"
+              value={dept}
+              onChange={(e) => setDept(e.target.value)}
+              aria-label="Therapy"
             >
-              <option value="">All My Specialties</option>
-              {user?.departments?.map(d => (
+              <option value="">All my therapies</option>
+              {user.departments.map((d) => (
                 <option key={d} value={d}>
-                  {getDeptLabel(d)}
+                  {getDeptName(d)}
                 </option>
               ))}
             </select>
-          </div>
-
-          {/* Status filter */}
-          <div style={{ minWidth: 140 }}>
-            <select
-              className="select"
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
-            >
-              <option value="active">Active Patients</option>
-              <option value="discharged">Discharged</option>
-              <option value="all">All Statuses</option>
-            </select>
-          </div>
+          )}
         </div>
-      </div>
+      </Card>
 
-      {/* Content */}
       {loading ? (
-        <div className="loading-screen">
-          <div className="spinner spinner-lg"></div>
-          <p className="mt-2">Loading patient roster...</p>
-        </div>
-      ) : patients.length === 0 ? (
-        <div className="card">
-          <div className="empty-state">
-            <div className="empty-icon">👶</div>
-            <div className="empty-title">No Patients Found</div>
-            <div className="empty-desc">
-              {search || departmentFilter
-                ? 'No assigned children match your current search or filter criteria.'
-                : 'You currently have no children assigned to your clinical caseload.'}
-            </div>
-          </div>
-        </div>
+        <Card>
+          <SkeletonRows rows={5} />
+        </Card>
+      ) : shown.length === 0 ? (
+        <Card>
+          <EmptyState
+            icon={Baby}
+            title={all.length ? `No ${noun} match` : `No ${noun} assigned yet`}
+            description={
+              all.length
+                ? 'Try a different search.'
+                : `Your branch admin assigns ${noun} to you when they register them.`
+            }
+          />
+        </Card>
       ) : (
-        <div className="grid-3" style={{ gap: '1.25rem', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}>
-          {patients.map((p) => (
-            <div
-              key={p._id}
-              className="card"
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                justifyContent: 'space-between',
-                transition: 'all 0.2s ease',
-                position: 'relative',
-                overflow: 'hidden',
-              }}
-            >
-              {/* Card top accent line based on primary dept */}
-              <div
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  height: 4,
-                  background: getDeptColor(p.enrolledDepartments?.[0]),
-                }}
-              />
-
-              <div>
-                {/* Child Header */}
-                <div className="flex items-start justify-between gap-3 mb-3">
-                  <div className="flex items-center gap-3">
-                    <div
-                      className="user-avatar-lg"
-                      style={{
-                        width: 48,
-                        height: 48,
-                        fontSize: '1.35rem',
-                        background: 'var(--surface-3)',
-                        color: 'var(--primary)',
-                      }}
-                    >
-                      {p.gender === 'female' ? '👧' : '👦'}
-                    </div>
-                    <div>
-                      <div className="font-bold text-base text-primary">{p.name}</div>
-                      <div className="text-xs text-muted">
-                        Age {p.age} • {p.gender}
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {shown.map((p) => {
+            const a = activity[p._id] || {};
+            return (
+              <Card key={p._id} className="flex flex-col">
+                <button
+                  type="button"
+                  className="text-left p-4 flex-1 hover:bg-surface-2 transition-colors rounded-t-[inherit]"
+                  onClick={() => setOpen(p._id)}
+                >
+                  <div className="flex items-start gap-3">
+                    <Avatar name={p.name} size="lg" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-fg truncate-1">{p.name}</span>
+                        {p.status !== 'active' && <PatientStatus status={p.status} />}
+                      </div>
+                      <div className="text-sm text-muted truncate-1">
+                        {p.age} yrs{p.diagnosis ? ` · ${p.diagnosis}` : ''}
                       </div>
                     </div>
                   </div>
-
-                  <span
-                    className="badge"
-                    style={{
-                      background: `${PATIENT_STATUSES[p.status]?.color}15`,
-                      color: PATIENT_STATUSES[p.status]?.color,
-                    }}
-                  >
-                    {PATIENT_STATUSES[p.status]?.label}
-                  </span>
-                </div>
-
-                {/* Diagnosis */}
-                {p.diagnosis && (
-                  <div
-                    className="card-compact mb-3"
-                    style={{ background: 'var(--surface-2)', padding: '0.5rem 0.75rem', fontSize: '0.775rem' }}
-                  >
-                    <span className="text-muted">Diagnosis: </span>
-                    <strong className="text-secondary">{p.diagnosis}</strong>
+                  <div className="mt-3">
+                    <DeptChips depts={p.enrolledDepartments} max={3} />
                   </div>
-                )}
-
-                {/* Enrolled Departments */}
-                <div className="mb-3">
-                  <div className="text-xs text-muted mb-1 font-semibold">Enrolled Care:</div>
-                  <div className="flex gap-1 flex-wrap">
-                    {p.enrolledDepartments?.map(d => (
-                      <span
-                        key={d}
-                        className="dept-chip"
-                        style={{ background: `${getDeptColor(d)}15`, color: getDeptColor(d) }}
-                      >
-                        {getDeptLabel(d)}
-                      </span>
-                    ))}
+                  <div className="mt-3 space-y-1.5 text-sm">
+                    <div className="flex items-center gap-2 text-fg-2">
+                      <CalendarDays size={14} className="text-muted" />
+                      {a.next ? (
+                        `Next: ${formatRelativeDay(a.next.date)}, ${formatClock(slotStart(a.next.timeSlot))}`
+                      ) : (
+                        <span className="text-muted">No session booked</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 text-fg-2">
+                      <History size={14} className="text-muted" />
+                      {a.last ? (
+                        `Last seen ${formatDate(a.last.date, { day: 'numeric', month: 'short' })}`
+                      ) : (
+                        <span className="text-muted">Not seen yet</span>
+                      )}
+                    </div>
                   </div>
-                </div>
-
-                {/* Parent Contact */}
-                {p.parentDetails?.name && (
-                  <div className="text-xs text-muted mb-3">
-                    Guardian: <strong className="text-secondary">{p.parentDetails.name}</strong>
-                    {p.parentDetails.phone && ` • 📞 ${p.parentDetails.phone}`}
-                  </div>
-                )}
-              </div>
-
-              {/* Card Footer Actions */}
-              <div
-                className="flex items-center gap-2 pt-3 mt-2"
-                style={{ borderTop: '1px solid var(--border)' }}
-              >
-                <button
-                  className="btn btn-primary btn-sm flex-1"
-                  onClick={() => setSelectedPatientForDossier(p)}
-                >
-                  📜 View Dossier
                 </button>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => setSchedulingPatient(p)}
-                  title="Schedule session for this child"
-                >
-                  🗓️ Book Session
-                </button>
-              </div>
-            </div>
-          ))}
+                <div className="flex items-center gap-2 px-4 py-2.5 border-t border-line">
+                  {a.toWrite > 0 ? (
+                    <Badge tone="amber" dot>
+                      <NotebookPen size={12} /> {a.toWrite} to write
+                    </Badge>
+                  ) : (
+                    <span className="text-xs text-muted">Notes up to date</span>
+                  )}
+                  {p.status === 'active' && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm ml-auto"
+                      onClick={() => setBooking(p)}
+                    >
+                      <CalendarPlus size={14} /> Book
+                    </button>
+                  )}
+                </div>
+              </Card>
+            );
+          })}
         </div>
       )}
-    </DashboardLayout>
+
+      {booking && (
+        <BookSessionModal
+          patient={booking}
+          self={user}
+          onClose={() => setBooking(null)}
+          onBooked={reload}
+        />
+      )}
+      {openId && (
+        <PatientDrawer
+          key={openId}
+          patientId={openId}
+          onClose={() => setOpen('')}
+          onChanged={reload}
+        />
+      )}
+    </>
   );
 };
 

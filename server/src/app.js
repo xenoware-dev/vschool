@@ -6,6 +6,7 @@ import branchRoutes from './routes/branchRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import patientRoutes from './routes/patientRoutes.js';
 import appointmentRoutes from './routes/appointmentRoutes.js';
+import billingRoutes from './routes/billingRoutes.js';
 import errorHandler from './middleware/errorMiddleware.js';
 
 const app = express();
@@ -33,6 +34,7 @@ app.use('/api/branches', branchRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/patients', patientRoutes);
 app.use('/api/appointments', appointmentRoutes);
+app.use('/api/billing', billingRoutes);
 
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {

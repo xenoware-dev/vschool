@@ -23,6 +23,8 @@ import User from './models/User.js';
 import Branch from './models/Branch.js';
 import Patient from './models/Patient.js';
 import Appointment from './models/Appointment.js';
+import Payment from './models/Payment.js';
+import Payout from './models/Payout.js';
 
 const ALL_DEPARTMENTS = [
   'pediatric_ot',
@@ -37,10 +39,12 @@ const ALL_DEPARTMENTS = [
   'psychology',
 ];
 
-const seed = async () => {
+export const seed = async () => {
   try {
-    await mongoose.connect(process.env.MONGO_URI);
-    console.log('✅ Connected to MongoDB');
+    if (mongoose.connection.readyState !== 1) {
+      await mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/vschool');
+      console.log('✅ Connected to MongoDB');
+    }
 
     // ─── Wipe existing seed data ────────────────────────────────────────────
     await Promise.all([
@@ -48,6 +52,8 @@ const seed = async () => {
       Branch.deleteMany({}),
       Patient.deleteMany({}),
       Appointment.deleteMany({}),
+      Payment.deleteMany({}),
+      Payout.deleteMany({}),
     ]);
     console.log('🗑  Cleared existing data');
 
@@ -334,40 +340,250 @@ const seed = async () => {
     // ─── Create Sample Appointments ─────────────────────────────────────────
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const dayOffset = (n) => {
+      const d = new Date(today);
+      d.setDate(d.getDate() + n);
+      return d;
+    };
 
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    const session = (fields) => ({
+      branch: brGuduvancherry._id,
+      status: 'scheduled',
+      scheduledBy: adminGdv._id,
+      ...fields,
+    });
+
+    const completedNotes = (extra) => ({
+      status: 'completed',
+      parentVisible: true,
+      notesUpdatedAt: new Date(),
+      ...extra,
+    });
 
     await Appointment.insertMany([
-      {
+      // Past sessions — documented and shared with the parent
+      session({
         patient: student1._id,
         therapist: therapistGdvSpeech._id,
-        branch: brGuduvancherry._id,
+        department: 'speech_language',
+        date: dayOffset(-9),
+        timeSlot: '10:30 - 11:15',
+        ...completedNotes({
+          soapNotes: {
+            subjective: 'Arrived calm and alert. Father reports better sleep this week.',
+            objective:
+              'Picture-card requesting (20 trials), two-step directions with visual prompts.',
+            assessment:
+              'Used 2-word requests in 14/20 trials, up from 9/20 last week. Needs one prompt for two-step directions.',
+            plan: 'Fade visual prompts for two-step directions; introduce "I want ___" carrier phrase.',
+          },
+          milestones: [
+            {
+              goal: 'Uses 2-3 word phrases to express spontaneous requests',
+              status: 'in_progress',
+            },
+            { goal: 'Follows two-step directions without visual prompts', status: 'emerging' },
+          ],
+          homeActivities:
+            'During snack time, hold the snack and wait for Arun to ask with two words ("want biscuit") before giving it. 5 minutes daily.',
+        }),
+      }),
+      session({
+        patient: student1._id,
+        therapist: therapistGdvOT._id,
+        department: 'pediatric_ot',
+        date: dayOffset(-8),
+        timeSlot: '11:15 - 12:00',
+        ...completedNotes({
+          soapNotes: {
+            subjective: 'Slightly restless on arrival; settled after 5 minutes on the swing.',
+            objective: 'Linear swing 10 min, weighted crayon tripod-grasp drill, bead threading.',
+            assessment:
+              'Maintained tripod grasp for 3 minutes (previously 1 minute). Threads 8 large beads independently.',
+            plan: 'Progress to smaller beads; add midline-crossing activities.',
+          },
+          milestones: [
+            { goal: 'Maintains tripod grasp on writing utensil', status: 'achieved' },
+            {
+              goal: 'Crosses physical midline during bilateral motor tasks',
+              status: 'in_progress',
+            },
+          ],
+          homeActivities:
+            'Play-dough rolling and pinching for 10 minutes each evening. Let him tear paper strips for a collage.',
+        }),
+      }),
+      session({
+        patient: student1._id,
+        therapist: therapistGdvSpeech._id,
+        department: 'speech_language',
+        date: dayOffset(-2),
+        timeSlot: '10:30 - 11:15',
+        ...completedNotes({
+          soapNotes: {
+            subjective: 'Cheerful, engaged quickly.',
+            objective: 'Carrier-phrase practice, turn-taking game with ball.',
+            assessment: 'Used "I want ___" spontaneously 3 times. Turn-taking held for 6 rounds.',
+            plan: 'Generalise carrier phrase to play contexts.',
+          },
+          milestones: [
+            { goal: 'Uses 2-3 word phrases to express spontaneous requests', status: 'achieved' },
+            {
+              goal: 'Maintains eye contact during conversational turn-taking',
+              status: 'in_progress',
+            },
+          ],
+          homeActivities:
+            'Roll a ball back and forth and say "my turn / your turn" each time. Praise every request he makes with words.',
+        }),
+      }),
+      session({
+        patient: student2._id,
+        therapist: therapistGdvSpeech._id,
+        department: 'speech_language',
+        date: dayOffset(-3),
+        timeSlot: '12:00 - 12:45',
+        ...completedNotes({
+          soapNotes: {
+            subjective: 'Shy at first, warmed up with bubbles.',
+            objective: '/s/ sound in isolation and initial position, mirror work.',
+            assessment: 'Produces /s/ in isolation 80% accuracy; initial position 50%.',
+            plan: 'Move to /s/ in initial position words with picture cues.',
+          },
+          milestones: [
+            {
+              goal: 'Imitates target phonemes /s/, /r/, /th/ with 70% accuracy',
+              status: 'emerging',
+            },
+          ],
+          homeActivities:
+            'Play "snake sounds" — make a long ssss sound together in front of a mirror, 5 times a day.',
+        }),
+      }),
+      // Completed but not yet documented — shows up as a to-do for the therapist
+      session({
+        patient: student2._id,
+        therapist: therapistGdvSpeech._id,
+        department: 'speech_language',
+        date: dayOffset(-1),
+        timeSlot: '12:00 - 12:45',
+        status: 'completed',
+      }),
+      session({
+        patient: student1._id,
+        therapist: therapistGdvOT._id,
+        department: 'sensory_integration',
+        date: dayOffset(-4),
+        timeSlot: '15:00 - 15:45',
+        status: 'no_show',
+      }),
+      // Today
+      session({
+        patient: student1._id,
+        therapist: therapistGdvSpeech._id,
         department: 'speech_language',
         date: today,
         timeSlot: '10:30 - 11:15',
-        status: 'scheduled',
-        scheduledBy: adminGdv._id,
-      },
-      {
+      }),
+      session({
         patient: student1._id,
         therapist: therapistGdvOT._id,
-        branch: brGuduvancherry._id,
         department: 'pediatric_ot',
         date: today,
         timeSlot: '11:15 - 12:00',
-        status: 'scheduled',
-        scheduledBy: adminGdv._id,
-      },
-      {
+      }),
+      session({
         patient: student2._id,
         therapist: therapistGdvSpeech._id,
-        branch: brGuduvancherry._id,
         department: 'speech_language',
-        date: tomorrow,
+        date: today,
+        timeSlot: '15:00 - 15:45',
+      }),
+      session({
+        patient: student1._id,
+        therapist: teacherGdvSpecial._id,
+        department: 'special_education',
+        date: today,
+        timeSlot: '13:30 - 14:15',
+      }),
+      // Upcoming
+      session({
+        patient: student2._id,
+        therapist: therapistGdvSpeech._id,
+        department: 'speech_language',
+        date: dayOffset(1),
         timeSlot: '10:30 - 11:15',
+      }),
+      session({
+        patient: student1._id,
+        therapist: therapistGdvOT._id,
+        department: 'sensory_integration',
+        date: dayOffset(2),
+        timeSlot: '16:30 - 17:15',
+      }),
+      // Vandalur
+      {
+        patient: student3._id,
+        therapist: therapistVdlPhysio._id,
+        branch: brVandalur._id,
+        department: 'physiotherapy',
+        date: today,
+        timeSlot: '12:00 - 12:45',
         status: 'scheduled',
-        scheduledBy: adminGdv._id,
+        scheduledBy: adminVdl._id,
+      },
+    ]);
+
+    // ─── Fee payments ───────────────────────────────────────────────────────
+    const year = today.getFullYear();
+    await Payment.insertMany([
+      {
+        receiptNo: `BR001-${year}-0001`,
+        branch: brGuduvancherry._id,
+        patient: student1._id,
+        department: 'speech_language',
+        description: 'Speech therapy — monthly package (8 sessions)',
+        amount: 8000,
+        method: 'upi',
+        status: 'paid',
+        paidAt: dayOffset(-10),
+        recordedBy: adminGdv._id,
+      },
+      {
+        receiptNo: `BR001-${year}-0002`,
+        branch: brGuduvancherry._id,
+        patient: student1._id,
+        department: 'special_school',
+        description: 'Special school — term fee',
+        amount: 15000,
+        method: 'bank_transfer',
+        status: 'paid',
+        paidAt: dayOffset(-6),
+        recordedBy: adminGdv._id,
+      },
+      {
+        receiptNo: `BR001-${year}-0003`,
+        branch: brGuduvancherry._id,
+        patient: student2._id,
+        department: 'speech_language',
+        description: 'Speech therapy — monthly package (4 sessions)',
+        amount: 4500,
+        method: 'cash',
+        status: 'pending',
+        dueDate: dayOffset(5),
+        recordedBy: adminGdv._id,
+      },
+      {
+        receiptNo: `BR002-${year}-0001`,
+        branch: brVandalur._id,
+        patient: student3._id,
+        department: 'special_school',
+        description: 'Special school — term fee',
+        amount: 15000,
+        method: 'upi',
+        status: 'paid',
+        paidAt: dayOffset(-3),
+        recordedBy: adminVdl._id,
       },
     ]);
 
@@ -391,12 +607,17 @@ const seed = async () => {
     console.log('Teacher Special (GDV) : teacher.gdv@vschool.com / password123');
     console.log('Parent Guduvancherry  : parent.gdv@example.com / password123');
     console.log('======================================================\n');
-
-    process.exit(0);
   } catch (err) {
     console.error('❌ Seed error:', err);
-    process.exit(1);
+    throw err;
   }
 };
 
-seed();
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isDirectRun) {
+  seed()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
+}
+
+export default seed;

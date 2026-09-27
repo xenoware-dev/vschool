@@ -19,13 +19,15 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
-// Response interceptor — handle 401 globally
+// Response interceptor — an expired/invalid session sends the user back to sign in.
+// A failed sign-in attempt is also a 401, but must stay on the page to show its message.
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401) {
+    const isLoginAttempt = error.config?.url?.includes('/auth/login');
+    if (error.response?.status === 401 && !isLoginAttempt) {
       localStorage.removeItem('token');
-      window.location.href = '/login';
+      if (window.location.pathname !== '/login') window.location.href = '/login';
     }
     return Promise.reject(error);
   }

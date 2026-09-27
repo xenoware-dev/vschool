@@ -44,11 +44,11 @@ const patientSchema = new mongoose.Schema(
 
     // ─── Parent Details (embedded for quick access) ─────────────────────────
     parentDetails: {
-      name:         { type: String, trim: true, default: '' },
-      phone:        { type: String, trim: true, default: '' },
-      email:        { type: String, trim: true, lowercase: true, default: '' },
+      name: { type: String, trim: true, default: '' },
+      phone: { type: String, trim: true, default: '' },
+      email: { type: String, trim: true, lowercase: true, default: '' },
       relationship: { type: String, trim: true, default: 'Parent' }, // Mother / Father / Guardian
-      address:      { type: String, trim: true, default: '' },
+      address: { type: String, trim: true, default: '' },
     },
 
     // ─── Linked system parent account (created by admin) ───────────────────

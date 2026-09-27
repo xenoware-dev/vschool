@@ -64,9 +64,24 @@ npm run dev              # Starts on http://localhost:5173
 
 | Method | Endpoint | Access | Description |
 |---|---|---|---|
-| POST | `/register` | Public | Register a new user |
 | POST | `/login` | Public | Login and receive JWT |
 | GET | `/me` | Private | Get current user profile |
+| PUT | `/password` | Private | Change own password |
+
+There is no public sign-up. The owner creates branches, admins and therapists; branch admins
+create therapists/teachers and parent logins (a parent login can be created while registering a child).
+
+### Other Routes
+
+| Prefix | Purpose |
+|---|---|
+| `/api/branches` | Branches; `GET /overview` returns per-branch headline numbers (owner) |
+| `/api/users` | Staff and parent accounts; `PATCH /:id/toggle`, `PATCH /:id/password` (owner, admin) |
+| `/api/patients` | Children; `POST` accepts `parentAccount: { email, password }` |
+| `/api/appointments` | Sessions; `GET` supports `date` or `from`/`to`; `PATCH /:id/notes` for therapists |
+| `/api/billing` | `payments` (fee receipts/invoices), `payroll` + `payouts` (monthly staff pay), `summary` |
+
+Every non-owner request is limited to the user's own branch.
 
 ### Health Check
 

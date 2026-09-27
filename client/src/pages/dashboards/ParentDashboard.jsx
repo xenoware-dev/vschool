@@ -1,217 +1,308 @@
-import { useState, useEffect } from 'react';
-import DashboardLayout from '../../components/DashboardLayout';
-import { patientsApi } from '../../api/patients';
-import { appointmentsApi } from '../../api/appointments';
-import { getDeptLabel, getDeptColor } from '../../utils/constants';
 import { Link } from 'react-router-dom';
+import {
+  CalendarDays,
+  Phone,
+  Home,
+  MessageSquareText,
+  Receipt,
+  ChevronRight,
+  Target,
+  Baby,
+} from 'lucide-react';
+import {
+  PageHeader,
+  Card,
+  CardHeader,
+  Avatar,
+  DeptChip,
+  DeptChips,
+  Badge,
+  EmptyState,
+  PageSkeleton,
+  Alert,
+} from '../../components/ui';
+import { useAuth } from '../../context/AuthContext';
+import {
+  toDateKey,
+  formatRelativeDay,
+  formatDate,
+  formatLongDate,
+  formatClock,
+  slotStart,
+  formatCurrency,
+  greeting,
+  firstName,
+} from '../../utils/format';
+import { useParentData } from './parent/useParentData';
+import ChildSwitcher from './parent/ChildSwitcher';
+import { cleanName, deptList } from './shared/helpers';
 
 const ParentDashboard = () => {
-  const [children, setChildren] = useState([]);
-  const [appointments, setAppointments] = useState([]);
-  const [progressNotes, setProgressNotes] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [selectedChild, setSelectedChild] = useState(null);
+  const { user } = useAuth();
+  const { loading, error, children, child, selectChild, sessions, payments } = useParentData();
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const [patientRes, apptRes] = await Promise.all([
-          patientsApi.getAll(),
-          appointmentsApi.getAll({ status: 'scheduled' }),
-        ]);
-        const kids = patientRes.data;
-        setChildren(kids);
-        if (kids.length > 0) setSelectedChild(kids[0]);
-        setAppointments(apptRes.data);
+  if (loading) return <PageSkeleton />;
 
-        // Fetch completed + parent-visible appointments for progress notes
-        const notesRes = await appointmentsApi.getAll({ status: 'completed' });
-        setProgressNotes(notesRes.data.filter(a => a.parentVisible && a.sessionNotes));
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, []);
-
-  const childAppts = selectedChild
-    ? appointments.filter(a => a.patient?._id === selectedChild._id)
-    : [];
-  const childNotes = selectedChild
-    ? progressNotes.filter(a => a.patient?._id === selectedChild._id)
-    : [];
-
-  if (loading) return (
-    <DashboardLayout>
-      <div className="loading-screen">
-        <div className="spinner spinner-lg"></div>
-        <p>Loading Parent Portal...</p>
-      </div>
-    </DashboardLayout>
-  );
+  const today = toDateKey();
+  const upcoming = sessions
+    .filter((s) => s.status === 'scheduled' && toDateKey(s.date) >= today)
+    .sort(
+      (a, b) =>
+        toDateKey(a.date).localeCompare(toDateKey(b.date)) || a.timeSlot.localeCompare(b.timeSlot)
+    );
+  const shared = sessions
+    .filter((s) => s.status === 'completed')
+    .sort((a, b) => toDateKey(b.date).localeCompare(toDateKey(a.date)));
+  const latest = shared.find((s) => s.soapNotes?.assessment || s.sessionNotes);
+  const homePlan = shared.find((s) => s.homeActivities);
+  const due = payments.filter((p) => p.status === 'pending');
+  const next = upcoming[0];
 
   return (
-    <DashboardLayout>
-      {/* Header */}
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Parent Portal</h1>
-          <p className="page-subtitle">Track your child's therapy progress, schedules, and clinical notes.</p>
-        </div>
-        <Link to="/dashboard/progress" className="btn btn-primary">
-          📈 View Skill Milestones &amp; Home Plan
-        </Link>
-      </div>
+    <>
+      <PageHeader
+        title={`${greeting()}, ${firstName(cleanName(user.name))}`}
+        description={formatLongDate(new Date())}
+        actions={<ChildSwitcher kids={children} child={child} onSelect={selectChild} />}
+      />
 
-      {children.length === 0 ? (
-        <div className="card">
-          <div className="empty-state">
-            <div className="empty-icon">👶</div>
-            <div className="empty-title">No Children Registered</div>
-            <div className="empty-desc">Please contact the clinic reception to link your child's profile to this account.</div>
-          </div>
-        </div>
+      {error && (
+        <Alert tone="danger" className="mb-4">
+          {error}
+        </Alert>
+      )}
+
+      {!child ? (
+        <Card>
+          <EmptyState
+            icon={Baby}
+            title="No child linked to your account yet"
+            description="Please ask the clinic reception to link your child’s profile to this login."
+          />
+        </Card>
       ) : (
-        <>
-          {/* Child selector */}
-          {children.length > 1 && (
-            <div className="flex gap-2 mb-3" style={{ flexWrap: 'wrap' }}>
-              {children.map((child) => (
-                <button
-                  key={child._id}
-                  className={`btn ${selectedChild?._id === child._id ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={() => setSelectedChild(child)}
-                >
-                  {child.name}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {selectedChild && (
-            <>
-              {/* Child info card */}
-              <div className="card mb-3" style={{ background: 'var(--primary-light)', border: '1px solid rgba(37,99,235,0.15)' }}>
-                <div className="flex gap-3 items-center">
-                  <div className="user-avatar-lg" style={{ width: 64, height: 64, fontSize: '1.75rem' }}>
-                    {selectedChild.gender === 'female' ? '👧' : '👦'}
-                  </div>
-                  <div className="flex-1">
-                    <div className="page-title mb-1">{selectedChild.name}</div>
-                    <div className="text-secondary text-sm mb-2">
-                      Age {selectedChild.age} • {selectedChild.gender} • Branch: <strong>{selectedChild.branch?.name}</strong>
-                    </div>
-                    {selectedChild.diagnosis && (
-                      <div className="badge" style={{ background: 'var(--surface)', color: 'var(--text-primary)', border: '1px solid var(--border)', fontSize: '0.75rem', padding: '0.35rem 0.75rem' }}>
-                        📋 Diagnosis: {selectedChild.diagnosis}
-                      </div>
-                    )}
-                    <div className="flex gap-1 mt-2" style={{ flexWrap: 'wrap' }}>
-                      {selectedChild.enrolledDepartments?.map((d) => (
-                        <span key={d} className="dept-chip" style={{ background: `${getDeptColor(d)}15`, color: getDeptColor(d), border: `1px solid ${getDeptColor(d)}30` }}>
-                          {getDeptLabel(d)}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
+        <div className="space-y-6">
+          <Card>
+            <div className="p-5 flex flex-wrap items-center gap-4">
+              <Avatar name={child.name} size="xl" />
+              <div className="min-w-0 flex-1">
+                <h2 className="text-lg font-semibold text-fg">{child.name}</h2>
+                <div className="text-sm text-muted">
+                  {child.age} yrs · {child.branch?.name}
+                  {child.studentId && (
+                    <>
+                      {' '}
+                      · <span className="mono-tag">{child.studentId}</span>
+                    </>
+                  )}
+                </div>
+                <div className="mt-2">
+                  <DeptChips depts={child.enrolledDepartments} max={6} />
                 </div>
               </div>
+              <div className="rounded-lg bg-surface-2 px-4 py-3 min-w-[220px]">
+                <div className="section-label mb-1">Next session</div>
+                {next ? (
+                  <>
+                    <div className="font-semibold text-fg">
+                      {formatRelativeDay(next.date)}, {formatClock(slotStart(next.timeSlot))}
+                    </div>
+                    <div className="text-sm text-muted">
+                      {deptList([next.department])} with {cleanName(next.therapist?.name)}
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-sm text-muted">
+                    Nothing booked yet — the clinic will schedule the next one.
+                  </div>
+                )}
+              </div>
+            </div>
+          </Card>
 
-              {/* Therapists */}
-              {selectedChild.assignedTherapists?.length > 0 && (
-                <div className="mb-3">
-                  <h2 className="section-label">Care Team</h2>
-                  <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-                    {selectedChild.assignedTherapists.map((t) => (
-                      <div key={t._id} className="card-compact flex items-center gap-2">
-                        <div className="user-avatar" style={{ background: 'var(--surface-3)', color: 'var(--primary)' }}>
-                          {t.name?.[0]}
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+            <div className="space-y-6">
+              <Card>
+                <CardHeader
+                  title="Latest update from the therapist"
+                  actions={
+                    <Link
+                      to={`/dashboard/progress?child=${child._id}`}
+                      className="btn btn-ghost btn-sm"
+                    >
+                      All progress <ChevronRight size={14} />
+                    </Link>
+                  }
+                />
+                {latest ? (
+                  <div className="card-body space-y-3">
+                    <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
+                      <DeptChip dept={latest.department} />
+                      <span>
+                        {formatDate(latest.date)} · {cleanName(latest.therapist?.name)}
+                      </span>
+                    </div>
+                    <p className="text-fg leading-relaxed whitespace-pre-line">
+                      {latest.soapNotes?.assessment || latest.sessionNotes}
+                    </p>
+                    {latest.soapNotes?.plan && (
+                      <p className="text-sm text-fg-2">
+                        <span className="font-medium text-fg">Next focus: </span>
+                        {latest.soapNotes.plan}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <EmptyState
+                    icon={MessageSquareText}
+                    title="No updates yet"
+                    description="Therapists share a short summary here after sessions."
+                  />
+                )}
+              </Card>
+
+              <Card>
+                <CardHeader
+                  title="Practice at home"
+                  description={
+                    homePlan
+                      ? `From ${cleanName(homePlan.therapist?.name)}, ${formatDate(homePlan.date)}`
+                      : undefined
+                  }
+                />
+                {homePlan ? (
+                  <div className="card-body">
+                    <p className="text-fg whitespace-pre-line leading-relaxed">
+                      {homePlan.homeActivities}
+                    </p>
+                    <Link
+                      to={`/dashboard/progress?child=${child._id}#home`}
+                      className="btn btn-secondary btn-sm mt-4"
+                    >
+                      <Home size={14} /> Open daily checklist
+                    </Link>
+                  </div>
+                ) : (
+                  <EmptyState
+                    icon={Home}
+                    title="No home activities yet"
+                    description="Your therapist will suggest simple activities to practise together."
+                  />
+                )}
+              </Card>
+            </div>
+
+            <div className="space-y-6">
+              <Card>
+                <CardHeader title="Upcoming sessions" />
+                {upcoming.length === 0 ? (
+                  <EmptyState icon={CalendarDays} title="Nothing booked" />
+                ) : (
+                  upcoming.slice(0, 5).map((s) => (
+                    <div key={s._id} className="list-row">
+                      <div className="w-24 shrink-0">
+                        <div className="text-sm font-medium text-fg">
+                          {formatRelativeDay(s.date)}
                         </div>
-                        <div>
-                          <div className="font-semibold text-sm">{t.name}</div>
+                        <div className="text-xs text-muted">
+                          {formatClock(slotStart(s.timeSlot))} · 45 min
+                        </div>
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm text-fg truncate-1">{deptList([s.department])}</div>
+                        <div className="text-xs text-muted truncate-1">
+                          {cleanName(s.therapist?.name)}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </Card>
+
+              <Card>
+                <CardHeader title="Care team" />
+                {child.assignedTherapists?.length ? (
+                  child.assignedTherapists.map((t) => (
+                    <div key={t._id} className="list-row">
+                      <Avatar name={t.name} size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium text-fg truncate-1">
+                          {cleanName(t.name)}
+                        </div>
+                        <div className="text-xs text-muted truncate-1">
+                          {deptList(t.departments)}
+                        </div>
+                      </div>
+                      {t.phone && (
+                        <a href={`tel:${t.phone}`} className="btn btn-secondary btn-sm">
+                          <Phone size={14} /> Call
+                        </a>
+                      )}
+                    </div>
+                  ))
+                ) : (
+                  <div className="p-4 text-sm text-muted">
+                    The clinic will assign therapists soon.
+                  </div>
+                )}
+              </Card>
+
+              <Card>
+                <CardHeader title="Fees" />
+                {payments.length === 0 ? (
+                  <EmptyState icon={Receipt} title="No fee records" />
+                ) : (
+                  <>
+                    {due.length > 0 && (
+                      <div className="px-4 pt-3">
+                        <Alert
+                          tone="warning"
+                          title={`${formatCurrency(due.reduce((n, p) => n + p.amount, 0))} due`}
+                        >
+                          Please pay at reception
+                          {due[0].dueDate ? ` by ${formatDate(due[0].dueDate)}` : ''}.
+                        </Alert>
+                      </div>
+                    )}
+                    {payments.slice(0, 4).map((p) => (
+                      <div key={p._id} className="list-row">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm text-fg truncate-1">{p.description}</div>
                           <div className="text-xs text-muted">
-                            {t.departments?.map(d => getDeptLabel(d).split(' ')[0]).join(', ')}
+                            {p.receiptNo} · {formatDate(p.paidAt || p.createdAt)}
                           </div>
+                        </div>
+                        <div className="text-right">
+                          <div className="text-sm font-medium text-fg tnum">
+                            {formatCurrency(p.amount)}
+                          </div>
+                          {p.status === 'paid' ? (
+                            <Badge tone="green">Paid</Badge>
+                          ) : (
+                            <Badge tone="amber">Due</Badge>
+                          )}
                         </div>
                       </div>
                     ))}
-                  </div>
-                </div>
-              )}
+                  </>
+                )}
+              </Card>
+            </div>
+          </div>
 
-              <div className="grid-2">
-                {/* Upcoming appointments */}
-                <div className="card">
-                  <div className="card-header">
-                    <h2 className="section-title">Upcoming Sessions</h2>
-                  </div>
-                  {childAppts.length === 0 ? (
-                    <div className="empty-state">
-                      <div className="empty-icon">📅</div>
-                      <div className="empty-title">No upcoming sessions</div>
-                    </div>
-                  ) : (
-                    <div className="timeline" style={{ paddingLeft: '0.5rem' }}>
-                      {childAppts.map((a) => (
-                        <div key={a._id} className="timeline-item">
-                          <div className="timeline-dot" style={{ borderColor: getDeptColor(a.department) }} />
-                          <div className="flex-1" style={{ marginTop: '-4px' }}>
-                            <div className="font-semibold text-primary">{getDeptLabel(a.department)}</div>
-                            <div className="text-sm text-secondary mt-1">
-                              <strong>{new Date(a.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</strong> • {a.timeSlot}
-                            </div>
-                            <div className="text-xs text-muted mt-1">
-                              Dr. {a.therapist?.name}
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* Progress notes */}
-                <div className="card">
-                  <div className="card-header">
-                    <h2 className="section-title">Therapy Progress Notes</h2>
-                  </div>
-                  {childNotes.length === 0 ? (
-                    <div className="empty-state">
-                      <div className="empty-icon">📝</div>
-                      <div className="empty-title">No notes shared yet</div>
-                      <div className="empty-desc">Clinical notes will appear here when therapists share them.</div>
-                    </div>
-                  ) : (
-                    <div className="flex" style={{ flexDirection: 'column', gap: '1rem' }}>
-                      {childNotes.map((a) => (
-                        <div key={a._id} className="card-compact" style={{ borderLeft: `4px solid ${getDeptColor(a.department)}` }}>
-                          <div className="flex justify-between items-center mb-2">
-                            <span className="font-semibold text-sm" style={{ color: getDeptColor(a.department) }}>
-                              {getDeptLabel(a.department)}
-                            </span>
-                            <span className="text-xs text-muted">
-                              {new Date(a.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
-                            </span>
-                          </div>
-                          <p className="text-sm text-primary mb-2" style={{ lineHeight: 1.6 }}>
-                            {a.sessionNotes}
-                          </p>
-                          <div className="text-xs text-muted">
-                            — Documented by Dr. {a.therapist?.name}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </>
-          )}
-        </>
+          <Link
+            to={`/dashboard/progress?child=${child._id}`}
+            className="card flex items-center gap-3 p-4 hover:bg-surface-2 transition-colors"
+          >
+            <Target size={18} className="text-primary" />
+            <span className="flex-1 text-fg font-medium">
+              See {child.name.split(' ')[0]}’s goals and progress
+            </span>
+            <ChevronRight size={16} className="text-muted" />
+          </Link>
+        </div>
       )}
-    </DashboardLayout>
+    </>
   );
 };
 

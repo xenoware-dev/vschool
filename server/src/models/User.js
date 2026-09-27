@@ -45,6 +45,12 @@ const userSchema = new mongoose.Schema(
       trim: true,
       default: '',
     },
+    // Pay per completed session (therapists & teachers) — drives monthly payroll
+    sessionRate: {
+      type: Number,
+      min: 0,
+      default: 650,
+    },
     // Used for parent role — linked children (patients)
     children: [
       {

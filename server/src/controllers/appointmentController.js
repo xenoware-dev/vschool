@@ -1,50 +1,89 @@
 import Appointment from '../models/Appointment.js';
+import Patient from '../models/Patient.js';
+import User from '../models/User.js';
 import { TIME_SLOTS } from '../utils/constants.js';
+import {
+  addDays,
+  dayRange,
+  outsideBranch,
+  sameId,
+  scopedBranch,
+  startOfDay,
+  userBranchId,
+} from '../utils/scope.js';
+
+const isClinician = (user) => ['therapist', 'teacher'].includes(user.role);
+
+// Statuses that occupy a slot (a cancelled / no-show slot can be rebooked)
+const OCCUPYING = ['scheduled', 'completed'];
+
+const populateFull = (query) =>
+  query
+    .populate('patient', 'name dateOfBirth gender studentId')
+    .populate('therapist', 'name email departments')
+    .populate('branch', 'name code');
+
+const findSlotConflict = async ({ therapist, patient, date, timeSlot, excludeId }) => {
+  const base = { date, timeSlot, status: { $in: OCCUPYING } };
+  if (excludeId) base._id = { $ne: excludeId };
+
+  if (await Appointment.exists({ ...base, therapist })) {
+    return `The therapist is already booked for ${timeSlot} on this date`;
+  }
+  if (patient && (await Appointment.exists({ ...base, patient }))) {
+    return `This child already has a session at ${timeSlot} on this date`;
+  }
+  return null;
+};
 
 // ─── Create Appointment (admin & therapist) ──────────────────────────────────
 // @route  POST /api/appointments
 export const createAppointment = async (req, res) => {
   let { patient, therapist, department, date, timeSlot } = req.body;
-  const branchId = req.user.branch?._id || req.user.branch;
+  const branchId = userBranchId(req.user);
 
   if (!branchId) {
     return res.status(400).json({ message: 'User must be assigned to a branch' });
   }
-
-  // If therapist or teacher is booking, default therapist to themselves
-  if (['therapist', 'teacher'].includes(req.user.role)) {
-    therapist = req.user._id;
+  if (!patient || !department || !date || !timeSlot) {
+    return res.status(400).json({ message: 'Child, department, date and time slot are required' });
+  }
+  if (!TIME_SLOTS.includes(timeSlot)) {
+    return res.status(400).json({ message: 'Invalid time slot' });
   }
 
-  // Normalize date to just date portion (no time)
-  const appointmentDate = new Date(date);
-  appointmentDate.setHours(0, 0, 0, 0);
+  // Therapists and teachers can only book themselves
+  if (isClinician(req.user)) therapist = req.user._id;
 
-  // Check therapist availability
-  const therapistConflict = await Appointment.findOne({
-    therapist,
-    date: appointmentDate,
-    timeSlot,
-    status: { $in: ['scheduled'] },
-  });
-  if (therapistConflict) {
-    return res.status(409).json({
-      message: `Therapist is already booked for the ${timeSlot} slot on this date`,
-    });
+  const [patientDoc, therapistDoc] = await Promise.all([
+    Patient.findById(patient).select('branch status assignedTherapists'),
+    User.findById(therapist).select('branch role isActive'),
+  ]);
+
+  if (!patientDoc || !sameId(patientDoc.branch, branchId)) {
+    return res.status(404).json({ message: 'Child not found in your branch' });
+  }
+  if (patientDoc.status !== 'active') {
+    return res.status(400).json({ message: 'Sessions can only be booked for active children' });
+  }
+  if (!therapistDoc || !isClinician(therapistDoc) || !sameId(therapistDoc.branch, branchId)) {
+    return res.status(404).json({ message: 'Therapist not found in your branch' });
+  }
+  if (!therapistDoc.isActive) {
+    return res.status(400).json({ message: 'This therapist account is inactive' });
+  }
+  if (
+    isClinician(req.user) &&
+    !patientDoc.assignedTherapists.some((t) => sameId(t, req.user._id))
+  ) {
+    return res
+      .status(403)
+      .json({ message: 'You can only book sessions for children assigned to you' });
   }
 
-  // Check patient not double-booked in same slot
-  const patientConflict = await Appointment.findOne({
-    patient,
-    date: appointmentDate,
-    timeSlot,
-    status: { $in: ['scheduled'] },
-  });
-  if (patientConflict) {
-    return res.status(409).json({
-      message: `Patient already has a session scheduled at ${timeSlot} on this date`,
-    });
-  }
+  const appointmentDate = startOfDay(date);
+  const conflict = await findSlotConflict({ therapist, patient, date: appointmentDate, timeSlot });
+  if (conflict) return res.status(409).json({ message: conflict });
 
   const appointment = await Appointment.create({
     patient,
@@ -57,63 +96,55 @@ export const createAppointment = async (req, res) => {
     scheduledBy: req.user._id,
   });
 
-  const populated = await Appointment.findById(appointment._id)
-    .populate('patient', 'name dateOfBirth gender')
-    .populate('therapist', 'name email departments')
-    .populate('branch', 'name code');
-
-  res.status(201).json(populated);
+  res.status(201).json(await populateFull(Appointment.findById(appointment._id)));
 };
 
 // ─── Get appointments ─────────────────────────────────────────────────────────
 // @route  GET /api/appointments
+// Query: branch, therapist, patient, department, status, date | from & to (YYYY-MM-DD, inclusive)
 export const getAppointments = async (req, res) => {
-  const { branch, therapist, patient, department, date, status } = req.query;
-  let filter = {};
+  const { branch, therapist, patient, department, date, from, to, status } = req.query;
+  const filter = {};
+  const role = req.user.role;
 
-  if (req.user.role === 'owner') {
-    if (branch) filter.branch = branch;
-  } else if (req.user.role === 'admin') {
-    filter.branch = req.user.branch?._id;
-  } else if (['therapist', 'teacher'].includes(req.user.role)) {
-    filter.branch = req.user.branch?._id;
-    // If specific patient history requested, show patient's sessions (optionally by therapist)
-    if (!patient) {
-      filter.therapist = req.user._id;
-    } else if (therapist) {
-      filter.therapist = therapist;
+  if (role === 'parent') {
+    // Parent sees upcoming sessions and completed sessions the therapist chose to share
+    filter.patient = { $in: req.user.children || [] };
+    filter.$or = [{ status: 'scheduled' }, { status: 'completed', parentVisible: true }];
+    if (patient)
+      filter.patient = { $in: (req.user.children || []).filter((c) => sameId(c, patient)) };
+  } else {
+    const scoped = scopedBranch(req.user, branch);
+    if (scoped) filter.branch = scoped;
+
+    if (isClinician(req.user)) {
+      // Own sessions, unless looking at an assigned child's full history
+      if (patient) {
+        const assigned = await Patient.exists({ _id: patient, assignedTherapists: req.user._id });
+        if (!assigned)
+          return res.status(403).json({ message: 'This child is not assigned to you' });
+        filter.patient = patient;
+      } else {
+        filter.therapist = req.user._id;
+      }
+    } else {
+      if (therapist) filter.therapist = therapist;
+      if (patient) filter.patient = patient;
     }
-  } else if (req.user.role === 'parent') {
-    // Parent sees appointments for their children only
-    // They get populated and we filter server-side
-    const patientIds = req.user.children || [];
-    filter.patient = { $in: patientIds };
-    // Only show parent-visible completed sessions + upcoming scheduled
-    filter.$or = [
-      { status: 'scheduled' },
-      { status: 'completed', parentVisible: true },
-    ];
+    if (status) filter.status = status;
   }
 
-  if (therapist && !['therapist', 'teacher'].includes(req.user.role)) filter.therapist = therapist;
-  if (patient) filter.patient = patient;
   if (department) filter.department = department;
-  if (status && req.user.role !== 'parent') filter.status = status;
 
   if (date) {
-    const d = new Date(date);
-    d.setHours(0, 0, 0, 0);
-    const dEnd = new Date(d);
-    dEnd.setDate(dEnd.getDate() + 1);
-    filter.date = { $gte: d, $lt: dEnd };
+    filter.date = dayRange(date);
+  } else if (from || to) {
+    filter.date = {};
+    if (from) filter.date.$gte = startOfDay(from);
+    if (to) filter.date.$lt = addDays(startOfDay(to), 1);
   }
 
-  const appointments = await Appointment.find(filter)
-    .populate('patient', 'name dateOfBirth gender')
-    .populate('therapist', 'name email departments')
-    .populate('branch', 'name code')
-    .sort({ date: 1, timeSlot: 1 });
-
+  const appointments = await populateFull(Appointment.find(filter)).sort({ date: 1, timeSlot: 1 });
   res.json(appointments);
 };
 
@@ -126,45 +157,64 @@ export const getAppointment = async (req, res) => {
     .populate('branch', 'name code city');
 
   if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
+
+  if (req.user.role === 'parent') {
+    if (!(req.user.children || []).some((c) => sameId(c, appointment.patient))) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+  } else if (outsideBranch(req.user, appointment.branch)) {
+    return res.status(403).json({ message: 'Access denied' });
+  }
+
   res.json(appointment);
 };
 
-// ─── Update appointment (admin — reschedule, cancel) ─────────────────────────
+// ─── Update appointment (admin — reschedule, reassign, change status) ────────
 // @route  PUT /api/appointments/:id
 export const updateAppointment = async (req, res) => {
-  const { date, timeSlot, therapist } = req.body;
-
   const appointment = await Appointment.findById(req.params.id);
   if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
 
-  // If rescheduling, check availability again
-  const newDate = date ? new Date(date) : appointment.date;
-  const newSlot = timeSlot || appointment.timeSlot;
-  const newTherapist = therapist || appointment.therapist;
-  if (date || timeSlot || therapist) {
-    newDate.setHours(0, 0, 0, 0);
-    const conflict = await Appointment.findOne({
-      _id: { $ne: appointment._id },
-      therapist: newTherapist,
-      date: newDate,
-      timeSlot: newSlot,
-      status: 'scheduled',
-    });
-    if (conflict) {
-      return res.status(409).json({ message: `Therapist already booked for ${newSlot} on this date` });
-    }
+  if (outsideBranch(req.user, appointment.branch)) {
+    return res.status(403).json({ message: 'Access denied' });
   }
 
-  const updated = await Appointment.findByIdAndUpdate(
-    req.params.id,
-    { ...req.body, date: newDate },
-    { new: true, runValidators: true }
-  )
-    .populate('patient', 'name')
-    .populate('therapist', 'name email')
-    .populate('branch', 'name code');
+  const { date, timeSlot, therapist, department, status } = req.body;
 
-  res.json(updated);
+  if (timeSlot && !TIME_SLOTS.includes(timeSlot)) {
+    return res.status(400).json({ message: 'Invalid time slot' });
+  }
+
+  if (therapist && !sameId(therapist, appointment.therapist)) {
+    const therapistDoc = await User.findById(therapist).select('branch role isActive');
+    if (
+      !therapistDoc ||
+      !isClinician(therapistDoc) ||
+      !sameId(therapistDoc.branch, appointment.branch)
+    ) {
+      return res.status(404).json({ message: 'Therapist not found in this branch' });
+    }
+    appointment.therapist = therapist;
+  }
+  if (date) appointment.date = startOfDay(date);
+  if (timeSlot) appointment.timeSlot = timeSlot;
+  if (department) appointment.department = department;
+  if (status) appointment.status = status;
+
+  // Re-check the slot whenever the booking stays live and its time/person changed
+  if ((date || timeSlot || therapist || status) && OCCUPYING.includes(appointment.status)) {
+    const conflict = await findSlotConflict({
+      therapist: appointment.therapist,
+      patient: appointment.patient,
+      date: appointment.date,
+      timeSlot: appointment.timeSlot,
+      excludeId: appointment._id,
+    });
+    if (conflict) return res.status(409).json({ message: conflict });
+  }
+
+  await appointment.save();
+  res.json(await populateFull(Appointment.findById(appointment._id)));
 };
 
 // ─── Add session notes (therapist only) ──────────────────────────────────────
@@ -176,96 +226,83 @@ export const addSessionNotes = async (req, res) => {
   if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
 
   // Therapist can only add notes to their own appointments
-  if (appointment.therapist.toString() !== req.user._id.toString()) {
+  if (!sameId(appointment.therapist, req.user._id)) {
     return res.status(403).json({ message: 'You can only add notes to your own sessions' });
   }
 
   if (soapNotes) {
     appointment.soapNotes = {
       subjective: soapNotes.subjective ?? appointment.soapNotes?.subjective ?? '',
-      objective:  soapNotes.objective  ?? appointment.soapNotes?.objective  ?? '',
+      objective: soapNotes.objective ?? appointment.soapNotes?.objective ?? '',
       assessment: soapNotes.assessment ?? appointment.soapNotes?.assessment ?? '',
-      plan:       soapNotes.plan       ?? appointment.soapNotes?.plan       ?? '',
+      plan: soapNotes.plan ?? appointment.soapNotes?.plan ?? '',
     };
   }
 
   if (homeActivities !== undefined) appointment.homeActivities = homeActivities;
-  if (milestones !== undefined) appointment.milestones = milestones;
+  if (milestones !== undefined) {
+    appointment.milestones = milestones.filter((m) => m?.goal?.trim());
+  }
 
   if (sessionNotes !== undefined) {
     appointment.sessionNotes = sessionNotes;
   } else if (soapNotes) {
-    // Generate text summary for backward compatibility
+    // Plain-text summary kept for older views
     const parts = [
       soapNotes.subjective ? `S: ${soapNotes.subjective}` : '',
-      soapNotes.objective  ? `O: ${soapNotes.objective}` : '',
+      soapNotes.objective ? `O: ${soapNotes.objective}` : '',
       soapNotes.assessment ? `A: ${soapNotes.assessment}` : '',
-      soapNotes.plan       ? `P: ${soapNotes.plan}` : '',
+      soapNotes.plan ? `P: ${soapNotes.plan}` : '',
     ].filter(Boolean);
-    if (parts.length > 0) {
-      appointment.sessionNotes = parts.join('\n\n');
-    }
+    appointment.sessionNotes = parts.join('\n\n');
   }
 
-  appointment.parentVisible = parentVisible ?? appointment.parentVisible;
-  appointment.notesUpdatedAt = new Date();
+  if (parentVisible !== undefined) appointment.parentVisible = parentVisible;
   if (status) appointment.status = status;
+  if (
+    soapNotes ||
+    homeActivities !== undefined ||
+    milestones !== undefined ||
+    sessionNotes !== undefined
+  ) {
+    appointment.notesUpdatedAt = new Date();
+  }
 
   await appointment.save();
-
-  const populated = await Appointment.findById(appointment._id)
-    .populate('patient', 'name dateOfBirth gender')
-    .populate('therapist', 'name email departments')
-    .populate('branch', 'name code');
-
-  res.json(populated);
+  res.json(await populateFull(Appointment.findById(appointment._id)));
 };
 
 // ─── Get available time slots for a therapist on a date ──────────────────────
-// @route  GET /api/appointments/slots?therapist=X&date=Y
+// @route  GET /api/appointments/slots?therapist=X&date=Y[&patient=Z]
 export const getAvailableSlots = async (req, res) => {
-  const { therapist, date } = req.query;
+  const { therapist, date, patient } = req.query;
   if (!therapist || !date) {
     return res.status(400).json({ message: 'therapist and date query params are required' });
   }
 
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  const dEnd = new Date(d);
-  dEnd.setDate(dEnd.getDate() + 1);
-
+  const range = dayRange(date);
+  const who = patient ? { $or: [{ therapist }, { patient }] } : { therapist };
   const booked = await Appointment.find({
-    therapist,
-    date: { $gte: d, $lt: dEnd },
-    status: 'scheduled',
+    ...who,
+    date: range,
+    status: { $in: OCCUPYING },
   }).select('timeSlot');
 
-  const bookedSlots = booked.map((a) => a.timeSlot);
+  const bookedSlots = [...new Set(booked.map((a) => a.timeSlot))];
   const available = TIME_SLOTS.filter((slot) => !bookedSlots.includes(slot));
 
   res.json({ available, booked: bookedSlots, all: TIME_SLOTS });
 };
 
-// ─── Get today's appointment summary (for dashboards) ────────────────────────
+// ─── Get today's appointments (for dashboards) ───────────────────────────────
 // @route  GET /api/appointments/today
 export const getTodayAppointments = async (req, res) => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const tomorrow = new Date(today);
-  tomorrow.setDate(tomorrow.getDate() + 1);
+  const filter = { date: dayRange(new Date()) };
 
-  const filter = {
-    date: { $gte: today, $lt: tomorrow },
-  };
+  const scoped = scopedBranch(req.user, req.query.branch);
+  if (scoped) filter.branch = scoped;
+  if (isClinician(req.user)) filter.therapist = req.user._id;
 
-  if (req.user.role === 'admin') filter.branch = req.user.branch?._id;
-  if (['therapist', 'teacher'].includes(req.user.role)) filter.therapist = req.user._id;
-
-  const appointments = await Appointment.find(filter)
-    .populate('patient', 'name gender')
-    .populate('therapist', 'name')
-    .populate('branch', 'name code')
-    .sort({ timeSlot: 1 });
-
+  const appointments = await populateFull(Appointment.find(filter)).sort({ timeSlot: 1 });
   res.json(appointments);
 };

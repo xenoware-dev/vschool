@@ -1,5 +1,7 @@
 import { Navigate, Outlet } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import BrandMark from '../components/BrandMark';
+import { Spinner } from '../components/ui';
 
 /**
  * ProtectedRoute — Blocks unauthenticated users
@@ -10,9 +12,9 @@ const ProtectedRoute = ({ allowedRoles }) => {
 
   if (loading) {
     return (
-      <div className="loading-screen">
-        <div className="spinner" />
-        <span style={{ color: 'var(--color-text-muted)', fontSize: '0.875rem' }}>Loading...</span>
+      <div className="splash" role="status" aria-label="Loading">
+        <BrandMark size={40} />
+        <Spinner />
       </div>
     );
   }

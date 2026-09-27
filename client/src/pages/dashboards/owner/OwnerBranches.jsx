@@ -1,353 +1,501 @@
-import { useState, useEffect } from 'react';
-import DashboardLayout from '../../../components/DashboardLayout';
+import { useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import {
+  Plus,
+  Pencil,
+  Power,
+  MapPin,
+  Phone,
+  Mail,
+  Building2,
+  Baby,
+  Users,
+  CalendarDays,
+  Wallet,
+  UserPlus,
+} from 'lucide-react';
+import {
+  PageHeader,
+  Card,
+  Modal,
+  ModalBody,
+  Drawer,
+  Field,
+  Alert,
+  Badge,
+  DeptChips,
+  PersonCell,
+  EmptyState,
+  SkeletonRows,
+  cx,
+  useToast,
+  useConfirm,
+} from '../../../components/ui';
+import { useApi } from '../../../hooks/useApi';
 import { branchApi } from '../../../api/branches';
-import { DEPARTMENTS, getDeptLabel, getDeptColor } from '../../../utils/constants';
+import { usersApi } from '../../../api/users';
+import { DEPARTMENTS, ROLES } from '../../../utils/constants';
+import { formatCurrency } from '../../../utils/format';
+import { StaffFormModal } from '../shared/StaffFormModal';
+import { apiError, cleanName, deptList } from '../shared/helpers';
 
-const OwnerBranches = () => {
-  const [branches, setBranches] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [showCreateModal, setShowCreateModal] = useState(false);
-
-  // Create form state
-  const [formData, setFormData] = useState({
-    name: '',
-    code: '',
-    address: '',
-    city: 'Bangalore',
-    phone: '',
-    email: '',
-    departments: ['pediatric_ot', 'speech_language', 'physiotherapy'],
+const BranchFormModal = ({ branch, onClose, onSaved }) => {
+  const toast = useToast();
+  const isEdit = Boolean(branch);
+  const [form, setForm] = useState({
+    name: branch?.name || '',
+    code: branch?.code || '',
+    city: branch?.city || '',
+    address: branch?.address || '',
+    phone: branch?.phone || '',
+    email: branch?.email || '',
+    facilities: branch?.facilities || ['school', 'clinic'],
+    departments: branch?.departments || DEPARTMENTS.map((d) => d.key),
   });
-  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+  const toggle = (k, v) =>
+    setForm((f) => ({ ...f, [k]: f[k].includes(v) ? f[k].filter((x) => x !== v) : [...f[k], v] }));
 
-  const loadBranches = async () => {
-    try {
-      const res = await branchApi.getAll();
-      setBranches(res.data);
-    } catch (err) {
-      console.error('Failed to load branches', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    loadBranches();
-  }, []);
-
-  const handleToggleDept = (key) => {
-    setFormData(prev => {
-      const exists = prev.departments.includes(key);
-      return {
-        ...prev,
-        departments: exists
-          ? prev.departments.filter(d => d !== key)
-          : [...prev.departments, key],
-      };
-    });
-  };
-
-  const handleCreateBranch = async (e) => {
+  const save = async (e) => {
     e.preventDefault();
-    if (!formData.name.trim() || !formData.code.trim()) {
-      setError('Branch name and code are required');
-      return;
-    }
-    setSubmitting(true);
-    setError('');
-
+    if (!form.name.trim() || !form.code.trim())
+      return setError('Branch name and code are required');
+    if (!form.facilities.length) return setError('Choose at least one facility');
+    setSaving(true);
     try {
-      await branchApi.create(formData);
-      setShowCreateModal(false);
-      setFormData({
-        name: '',
-        code: '',
-        address: '',
-        city: 'Bangalore',
-        phone: '',
-        email: '',
-        departments: ['pediatric_ot', 'speech_language', 'physiotherapy'],
+      const payload = { ...form, code: form.code.trim().toUpperCase() };
+      const { data } = isEdit
+        ? await branchApi.update(branch._id, payload)
+        : await branchApi.create(payload);
+      toast({
+        title: isEdit ? 'Branch updated' : `${data.name} created`,
+        description: isEdit ? undefined : 'Next, add a branch admin',
       });
-      await loadBranches();
+      onSaved(data);
     } catch (err) {
-      setError(err.response?.data?.message || 'Failed to create branch');
-    } finally {
-      setSubmitting(false);
+      setError(apiError(err));
+      setSaving(false);
     }
   };
-
-  const handleToggleStatus = async (branchId) => {
-    try {
-      await branchApi.toggle(branchId);
-      await loadBranches();
-    } catch (err) {
-      console.error('Failed to toggle branch status', err);
-    }
-  };
-
-  const activeCount = branches.filter(b => b.isActive).length;
 
   return (
-    <DashboardLayout>
-      {/* Create Branch Modal */}
-      {showCreateModal && (
-        <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
-          <div className="modal modal-lg" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <div>
-                <h3 className="modal-title">Create Clinic Branch</h3>
-                <div className="text-xs text-muted mt-1">Add a new center to your healthcare network</div>
-              </div>
-              <button className="btn btn-ghost btn-icon" onClick={() => setShowCreateModal(false)}>✕</button>
+    <Modal
+      size="lg"
+      title={isEdit ? `Edit ${branch.name}` : 'New branch'}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn btn-secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" form="branch-form" className="btn btn-primary" disabled={saving}>
+            {saving ? 'Saving…' : isEdit ? 'Save changes' : 'Create branch'}
+          </button>
+        </>
+      }
+    >
+      <ModalBody>
+        <form id="branch-form" onSubmit={save} className="space-y-4">
+          {error && <Alert tone="danger">{error}</Alert>}
+          <div className="grid gap-4 sm:grid-cols-[2fr_1fr]">
+            <Field label="Branch name" htmlFor="bf-name">
+              <input
+                id="bf-name"
+                className="input"
+                value={form.name}
+                onChange={set('name')}
+                placeholder="e.g. Tambaram Branch"
+              />
+            </Field>
+            <Field label="Code" htmlFor="bf-code" hint="Used in student IDs and receipts">
+              <input
+                id="bf-code"
+                className="input font-mono uppercase"
+                value={form.code}
+                onChange={set('code')}
+                placeholder="BR006"
+              />
+            </Field>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="City" htmlFor="bf-city">
+              <input id="bf-city" className="input" value={form.city} onChange={set('city')} />
+            </Field>
+            <Field label="Phone" htmlFor="bf-phone" optional>
+              <input
+                id="bf-phone"
+                type="tel"
+                className="input"
+                value={form.phone}
+                onChange={set('phone')}
+              />
+            </Field>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Address" htmlFor="bf-addr" optional>
+              <input
+                id="bf-addr"
+                className="input"
+                value={form.address}
+                onChange={set('address')}
+              />
+            </Field>
+            <Field label="Email" htmlFor="bf-email" optional>
+              <input
+                id="bf-email"
+                type="email"
+                className="input"
+                value={form.email}
+                onChange={set('email')}
+              />
+            </Field>
+          </div>
+          <Field label="Facilities">
+            <div className="grid gap-2 grid-cols-2">
+              {[
+                ['clinic', 'Therapy clinic'],
+                ['school', 'Special school'],
+              ].map(([v, label]) => (
+                <button
+                  key={v}
+                  type="button"
+                  className={cx('option-card', form.facilities.includes(v) && 'is-selected')}
+                  onClick={() => toggle('facilities', v)}
+                >
+                  <input
+                    type="checkbox"
+                    readOnly
+                    checked={form.facilities.includes(v)}
+                    tabIndex={-1}
+                  />
+                  {label}
+                </button>
+              ))}
             </div>
+          </Field>
+          <Field label={`Therapies offered (${form.departments.length})`}>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {DEPARTMENTS.map((d) => {
+                const on = form.departments.includes(d.key);
+                return (
+                  <button
+                    key={d.key}
+                    type="button"
+                    className={cx('option-card', on && 'is-selected')}
+                    onClick={() => toggle('departments', d.key)}
+                  >
+                    <input type="checkbox" readOnly checked={on} tabIndex={-1} />
+                    <span className="chip-dot" style={{ background: d.color }} />
+                    <span className="truncate-1">{d.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </Field>
+        </form>
+      </ModalBody>
+    </Modal>
+  );
+};
 
-            {error && (
-              <div className="card-compact mb-3" style={{ background: 'var(--error-bg)', color: 'var(--error)', border: '1px solid #fecaca' }}>
-                ⚠️ {error}
+const BranchDrawer = ({ row, branches, onClose, onEdit, onToggle, onChanged }) => {
+  const { branch } = row;
+  const [adding, setAdding] = useState(false);
+  const {
+    data: staff,
+    loading,
+    reload,
+  } = useApi(
+    async () =>
+      (await usersApi.getAll({ branch: branch._id, role: 'admin,therapist,teacher' })).data,
+    [branch._id]
+  );
+  const admins = (staff || []).filter((u) => u.role === 'admin');
+
+  return (
+    <>
+      <Drawer
+        onClose={onClose}
+        width={560}
+        header={
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-lg font-semibold text-fg">{branch.name}</h2>
+              {branch.isActive ? (
+                <Badge tone="green" dot>
+                  Active
+                </Badge>
+              ) : (
+                <Badge tone="gray" dot>
+                  Inactive
+                </Badge>
+              )}
+            </div>
+            <div className="text-sm text-muted">
+              <span className="mono-tag">{branch.code}</span> {branch.city}
+            </div>
+          </div>
+        }
+        footer={
+          <>
+            <button type="button" className="btn btn-ghost mr-auto" onClick={onToggle}>
+              <Power size={15} /> {branch.isActive ? 'Deactivate' : 'Reactivate'}
+            </button>
+            <button type="button" className="btn btn-primary" onClick={onEdit}>
+              <Pencil size={15} /> Edit branch
+            </button>
+          </>
+        }
+      >
+        <div className="drawer-body space-y-6">
+          <div className="grid grid-cols-2 gap-3">
+            {[
+              [Baby, 'Active children', row.activePatients],
+              [Users, 'Therapists & teachers', row.clinicians],
+              [CalendarDays, 'Sessions today', `${row.todayCompleted}/${row.todaySessions}`],
+              [Wallet, 'Fees this month', formatCurrency(row.monthRevenue)],
+            ].map(([Icon, label, value]) => (
+              <div key={label} className="rounded-lg border border-line p-3">
+                <div className="flex items-center gap-1.5 text-xs text-muted">
+                  <Icon size={13} /> {label}
+                </div>
+                <div className="text-lg font-semibold text-fg tnum mt-0.5">{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <section className="space-y-1.5 text-sm text-fg-2">
+            {branch.address && (
+              <div className="flex items-center gap-2">
+                <MapPin size={14} className="text-muted" /> {branch.address}
               </div>
             )}
-
-            <form onSubmit={handleCreateBranch} className="flex" style={{ flexDirection: 'column', gap: '1rem' }}>
-              <div className="grid-2" style={{ gap: '1rem' }}>
-                <div className="form-group">
-                  <label className="form-label font-semibold">Branch Name *</label>
-                  <input
-                    type="text"
-                    className="input"
-                    placeholder="e.g. Absolute — North Bangalore"
-                    value={formData.name}
-                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                    required
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label font-semibold">Branch Code * (e.g. ASST-NORTH)</label>
-                  <input
-                    type="text"
-                    className="input"
-                    placeholder="ASST-NORTH"
-                    value={formData.code}
-                    onChange={(e) => setFormData({ ...formData, code: e.target.value.toUpperCase() })}
-                    required
-                  />
-                </div>
+            {branch.phone && (
+              <div className="flex items-center gap-2">
+                <Phone size={14} className="text-muted" /> {branch.phone}
               </div>
-
-              <div className="grid-2" style={{ gap: '1rem' }}>
-                <div className="form-group">
-                  <label className="form-label font-semibold">City</label>
-                  <input
-                    type="text"
-                    className="input"
-                    value={formData.city}
-                    onChange={(e) => setFormData({ ...formData, city: e.target.value })}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label font-semibold">Phone Number</label>
-                  <input
-                    type="tel"
-                    className="input"
-                    placeholder="+91 80 4567 8902"
-                    value={formData.phone}
-                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                  />
-                </div>
+            )}
+            {branch.email && (
+              <div className="flex items-center gap-2">
+                <Mail size={14} className="text-muted" /> {branch.email}
               </div>
+            )}
+          </section>
 
-              <div className="form-group">
-                <label className="form-label font-semibold">Branch Email</label>
-                <input
-                  type="email"
-                  className="input"
-                  placeholder="north@pediatrictherapy.com"
-                  value={formData.email}
-                  onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                />
-              </div>
+          <section>
+            <div className="section-label mb-2">Therapies offered</div>
+            <DeptChips depts={branch.departments} max={10} />
+          </section>
 
-              <div className="form-group">
-                <label className="form-label font-semibold">Address</label>
-                <input
-                  type="text"
-                  className="input"
-                  placeholder="Street, Landmark, Area"
-                  value={formData.address}
-                  onChange={(e) => setFormData({ ...formData, address: e.target.value })}
-                />
+          <section>
+            <div className="flex items-center justify-between mb-2">
+              <div className="section-label">Staff</div>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setAdding(true)}
+              >
+                <UserPlus size={14} /> Add
+              </button>
+            </div>
+            {!loading && admins.length === 0 && (
+              <Alert tone="warning" className="mb-3">
+                This branch has no admin — nobody can register children or book sessions there yet.
+              </Alert>
+            )}
+            {loading ? (
+              <SkeletonRows rows={3} />
+            ) : staff.length === 0 ? (
+              <div className="text-sm text-muted">No staff yet.</div>
+            ) : (
+              <div className="card">
+                {staff.map((u) => (
+                  <div key={u._id} className={cx('list-row', !u.isActive && 'opacity-60')}>
+                    <PersonCell
+                      name={cleanName(u.name)}
+                      sub={u.role === 'admin' ? u.email : deptList(u.departments)}
+                      size="sm"
+                    />
+                    <Badge tone={ROLES[u.role]?.tone} className="ml-auto">
+                      {ROLES[u.role]?.label}
+                    </Badge>
+                  </div>
+                ))}
               </div>
-
-              {/* Departments Offered */}
-              <div className="form-group">
-                <label className="form-label font-semibold">Clinical Departments Offered at this Branch</label>
-                <div className="grid-2" style={{ gap: '0.5rem' }}>
-                  {DEPARTMENTS.map(d => {
-                    const isSelected = formData.departments.includes(d.key);
-                    return (
-                      <div
-                        key={d.key}
-                        onClick={() => handleToggleDept(d.key)}
-                        className="p-2 flex items-center gap-2"
-                        style={{
-                          cursor: 'pointer',
-                          borderRadius: 'var(--r-md)',
-                          background: isSelected ? `${d.color}15` : 'var(--surface-2)',
-                          border: isSelected ? `1.5px solid ${d.color}` : '1px solid var(--border)',
-                          transition: 'all 0.15s ease',
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => {}}
-                          style={{ accentColor: d.color }}
-                        />
-                        <span className="text-xs font-semibold" style={{ color: isSelected ? d.color : 'var(--text-primary)' }}>
-                          {d.label}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="flex justify-between items-center pt-3" style={{ borderTop: '1px solid var(--border)' }}>
-                <button type="button" className="btn btn-secondary" onClick={() => setShowCreateModal(false)}>
-                  Cancel
-                </button>
-                <button type="submit" className="btn btn-primary" disabled={submitting}>
-                  {submitting ? 'Creating Branch...' : '✓ Create Branch'}
-                </button>
-              </div>
-            </form>
-          </div>
+            )}
+          </section>
         </div>
+      </Drawer>
+      {adding && (
+        <StaffFormModal
+          roles={
+            admins.length ? ['therapist', 'teacher', 'admin'] : ['admin', 'therapist', 'teacher']
+          }
+          branches={branches}
+          defaultBranch={branch._id}
+          onClose={() => setAdding(false)}
+          onSaved={() => {
+            reload();
+            onChanged();
+          }}
+        />
+      )}
+    </>
+  );
+};
+
+const OwnerBranches = () => {
+  const toast = useToast();
+  const confirm = useConfirm();
+  const [params, setParams] = useSearchParams();
+  const [editing, setEditing] = useState(null);
+  const {
+    data: rows,
+    loading,
+    error,
+    reload,
+  } = useApi(async () => (await branchApi.getOverview()).data);
+
+  const setParam = (key, value) => {
+    const next = new URLSearchParams();
+    if (value) next.set(key, value);
+    setParams(next, { replace: true });
+  };
+  const openRow = rows?.find((r) => r.branch._id === params.get('open'));
+  const adding = params.get('add') === '1';
+
+  const toggle = async (branch) => {
+    if (branch.isActive) {
+      const ok = await confirm({
+        title: `Deactivate ${branch.name}?`,
+        description:
+          'Staff and parents at this branch will not be able to sign in until it is reactivated. No data is deleted.',
+        confirmLabel: 'Deactivate branch',
+        tone: 'danger',
+      });
+      if (!ok) return;
+    }
+    try {
+      const { data } = await branchApi.toggle(branch._id);
+      toast({ title: data.message });
+      reload();
+    } catch (err) {
+      toast({ title: 'Could not update branch', description: apiError(err), tone: 'error' });
+    }
+  };
+
+  return (
+    <>
+      <PageHeader
+        title="Branches"
+        description="Your centres, what each one offers, and who runs it"
+        actions={
+          <button type="button" className="btn btn-primary" onClick={() => setParam('add', '1')}>
+            <Plus size={16} /> New branch
+          </button>
+        }
+      />
+
+      {error && (
+        <Alert tone="danger" className="mb-4">
+          {error}
+        </Alert>
       )}
 
-      {/* Header */}
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Branch Network Management</h1>
-          <p className="page-subtitle">
-            Configure locations, manage capacity, and assign medical specialties across your centers.
-          </p>
-        </div>
-        <button className="btn btn-primary" onClick={() => setShowCreateModal(true)}>
-          + Create New Branch
-        </button>
-      </div>
-
-      {/* Stats Grid */}
-      <div className="stats-grid mb-4">
-        {[
-          { icon: '🏢', label: 'Total Branches', value: branches.length, color: 'var(--primary)' },
-          { icon: '✅', label: 'Active Facilities', value: activeCount, color: 'var(--emerald)' },
-          { icon: '📍', label: 'Primary City', value: 'Bangalore', color: 'var(--amber)' },
-          { icon: '🩺', label: 'Network Specialties', value: DEPARTMENTS.length, color: 'var(--violet)' },
-        ].map(s => (
-          <div key={s.label} className="stat-card" style={{ '--stat-color': s.color }}>
-            <div className="stat-card-top">
-              <div className="stat-icon" style={{ background: `${s.color}22`, color: s.color }}>
-                {s.icon}
-              </div>
-            </div>
-            <div>
-              <div className="stat-value">{s.value}</div>
-              <div className="stat-label">{s.label}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Branch Cards */}
       {loading ? (
-        <div className="loading-screen">
-          <div className="spinner spinner-lg"></div>
-          <p className="mt-2">Loading branch network...</p>
-        </div>
+        <Card>
+          <SkeletonRows rows={5} />
+        </Card>
+      ) : !rows?.length ? (
+        <Card>
+          <EmptyState
+            icon={Building2}
+            title="No branches yet"
+            description="Create your first centre to get started."
+          />
+        </Card>
       ) : (
-        <div className="grid-2" style={{ gap: '1.25rem' }}>
-          {branches.map(b => (
-            <div
-              key={b._id}
-              className="card"
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                justifyContent: 'space-between',
-                borderLeft: b.isActive ? '4px solid var(--emerald)' : '4px solid var(--rose)',
-              }}
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {rows.map((r) => (
+            <button
+              key={r.branch._id}
+              type="button"
+              className={cx(
+                'card text-left p-4 hover:shadow-md transition-shadow flex flex-col gap-3',
+                !r.branch.isActive && 'opacity-60'
+              )}
+              onClick={() => setParam('open', r.branch._id)}
             >
-              <div>
-                <div className="flex justify-between items-start mb-2">
-                  <div>
-                    <h3 className="text-base font-bold text-primary">{b.name}</h3>
-                    <div className="text-xs text-muted mt-0.5">
-                      Code: <strong className="text-secondary">{b.code}</strong> • {b.city}
-                    </div>
-                  </div>
-
-                  <button
-                    className="badge"
-                    style={{
-                      cursor: 'pointer',
-                      background: b.isActive ? 'var(--success-bg)' : 'var(--error-bg)',
-                      color: b.isActive ? 'var(--success)' : 'var(--error)',
-                      borderColor: b.isActive ? '#bbf7d0' : '#fecaca',
-                    }}
-                    onClick={() => handleToggleStatus(b._id)}
-                    title="Click to toggle active status"
-                  >
-                    {b.isActive ? '● Active' : '○ Inactive'}
-                  </button>
-                </div>
-
-                <div className="card-compact mb-3" style={{ background: 'var(--surface-2)', fontSize: '0.8rem' }}>
-                  <div className="text-secondary">
-                    📍 {b.address || 'Address not listed'}
-                  </div>
-                  {(b.phone || b.email) && (
-                    <div className="text-muted mt-1">
-                      📞 {b.phone || '—'} • ✉️ {b.email || '—'}
-                    </div>
-                  )}
-                </div>
-
-                <div>
-                  <div className="text-xs text-muted mb-1 font-semibold">Available Specialties ({b.departments?.length || 0}):</div>
-                  <div className="flex gap-1 flex-wrap">
-                    {b.departments?.map(d => (
-                      <span
-                        key={d}
-                        className="dept-chip"
-                        style={{ background: `${getDeptColor(d)}15`, color: getDeptColor(d) }}
-                      >
-                        {getDeptLabel(d)}
-                      </span>
-                    ))}
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="font-semibold text-fg truncate-1">{r.branch.name}</div>
+                  <div className="text-sm text-muted">
+                    <span className="mono-tag">{r.branch.code}</span> {r.branch.city}
                   </div>
                 </div>
+                {r.branch.isActive ? (
+                  <Badge tone="green" dot>
+                    Active
+                  </Badge>
+                ) : (
+                  <Badge tone="gray" dot>
+                    Inactive
+                  </Badge>
+                )}
               </div>
-
-              <div className="flex justify-between items-center pt-3 mt-4" style={{ borderTop: '1px solid var(--border)' }}>
-                <span className="text-xs text-muted">
-                  Created {new Date(b.createdAt).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' })}
-                </span>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => handleToggleStatus(b._id)}
-                >
-                  {b.isActive ? 'Deactivate Branch' : 'Activate Branch'}
-                </button>
+              <div className="grid grid-cols-3 gap-2 text-center">
+                {[
+                  ['Children', r.activePatients],
+                  ['Therapists', r.clinicians],
+                  ['Today', r.todaySessions],
+                ].map(([label, value]) => (
+                  <div key={label} className="rounded-lg bg-surface-2 py-2">
+                    <div className="text-lg font-semibold text-fg tnum">{value}</div>
+                    <div className="text-xs text-muted">{label}</div>
+                  </div>
+                ))}
               </div>
-            </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted">{r.branch.departments?.length || 0} therapies</span>
+                {r.admins === 0 ? (
+                  <Badge tone="amber">No admin</Badge>
+                ) : (
+                  <span className="text-fg-2">{formatCurrency(r.monthRevenue)} this month</span>
+                )}
+              </div>
+            </button>
           ))}
         </div>
       )}
-    </DashboardLayout>
+
+      {openRow && (
+        <BranchDrawer
+          key={openRow.branch._id}
+          row={openRow}
+          branches={rows.map((r) => r.branch)}
+          onClose={() => setParam('open', '')}
+          onEdit={() => setEditing(openRow.branch)}
+          onToggle={() => toggle(openRow.branch)}
+          onChanged={reload}
+        />
+      )}
+      {(adding || editing) && (
+        <BranchFormModal
+          branch={editing}
+          onClose={() => {
+            setEditing(null);
+            if (adding) setParam('add', '');
+          }}
+          onSaved={(b) => {
+            setEditing(null);
+            reload();
+            setParam('open', b._id);
+          }}
+        />
+      )}
+    </>
   );
 };
 

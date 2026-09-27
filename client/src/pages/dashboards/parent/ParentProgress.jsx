@@ -1,480 +1,311 @@
-import { useState, useEffect } from 'react';
-import DashboardLayout from '../../../components/DashboardLayout';
-import { patientsApi } from '../../../api/patients';
-import { appointmentsApi } from '../../../api/appointments';
-import { getDeptLabel, getDeptColor } from '../../../utils/constants';
+import { useEffect, useMemo, useState } from 'react';
+import { Target, Home, MessageSquareText, Check, Trophy, Baby } from 'lucide-react';
+import {
+  PageHeader,
+  Card,
+  CardHeader,
+  Stat,
+  Badge,
+  DeptChip,
+  Progress,
+  EmptyState,
+  PageSkeleton,
+  Alert,
+  cx,
+} from '../../../components/ui';
+import { getDeptColor } from '../../../utils/constants';
+import { toDateKey, addDays, parseDateKey, formatDate, pct } from '../../../utils/format';
+import { useParentData } from './useParentData';
+import ChildSwitcher from './ChildSwitcher';
+import { cleanName, MILESTONE_STATUSES } from '../shared/helpers';
+
+// Home-practice ticks are a per-device convenience, so they live in localStorage
+const STORE_KEY = 'vschool_home_practice';
+const readTicks = () => {
+  try {
+    return JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+  } catch {
+    return {};
+  }
+};
+const writeTicks = (ticks) => {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(ticks));
+  } catch {
+    /* storage unavailable — ticks just won't persist */
+  }
+};
+
+const STATUS_ORDER = { in_progress: 0, emerging: 1, not_started: 2, achieved: 3 };
 
 const ParentProgress = () => {
-  const [children, setChildren] = useState([]);
-  const [selectedChild, setSelectedChild] = useState(null);
-  const [appointments, setAppointments] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  // Home practice tracker state (persisted per child in localStorage)
-  const [completedPractices, setCompletedPractices] = useState({});
+  const { loading, error, children, child, selectChild, sessions } = useParentData();
+  const [ticks, setTicks] = useState(readTicks);
 
   useEffect(() => {
-    const loadParentData = async () => {
-      try {
-        const [patientsRes, apptsRes] = await Promise.all([
-          patientsApi.getAll(),
-          appointmentsApi.getAll({ status: 'completed' }),
-        ]);
-        const kids = patientsRes.data;
-        setChildren(kids);
-        if (kids.length > 0) {
-          setSelectedChild(kids[0]);
-        }
-        // Only parent-visible appointments
-        setAppointments(apptsRes.data.filter(a => a.parentVisible));
+    if (window.location.hash === '#home')
+      document.getElementById('home')?.scrollIntoView({ behavior: 'smooth' });
+  }, [loading]);
 
-        // Load practice checklist from localStorage
-        const saved = localStorage.getItem('vschool_home_practices');
-        if (saved) {
-          try {
-            setCompletedPractices(JSON.parse(saved));
-          } catch (e) {
-            console.error(e);
-          }
-        }
-      } catch (err) {
-        console.error('Failed to load parent progress data', err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    loadParentData();
-  }, []);
+  const shared = useMemo(
+    () =>
+      sessions
+        .filter((s) => s.status === 'completed')
+        .sort((a, b) => toDateKey(b.date).localeCompare(toDateKey(a.date))),
+    [sessions]
+  );
 
-  const childAppts = selectedChild
-    ? appointments.filter(a => a.patient?._id === selectedChild._id)
-    : [];
-
-  // Extract all unique milestones from this child's appointments
-  const allMilestones = [];
-  const seenGoals = new Set();
-  childAppts.forEach(a => {
-    if (a.milestones && a.milestones.length > 0) {
-      a.milestones.forEach(m => {
-        if (!seenGoals.has(m.goal)) {
-          seenGoals.add(m.goal);
-          allMilestones.push({ ...m, department: a.department, date: a.date });
-        }
-      });
-    }
-  });
-
-  // Extract home activities assigned in sessions
-  const homeActivitiesList = childAppts
-    .filter(a => a.homeActivities && a.homeActivities.trim().length > 0)
-    .map(a => ({
-      id: a._id,
-      text: a.homeActivities,
-      department: a.department,
-      therapist: a.therapist?.name,
-      date: a.date,
-    }));
-
-  const handleTogglePractice = (practiceId) => {
-    setCompletedPractices(prev => {
-      const today = new Date().toISOString().split('T')[0];
-      const childKey = `${selectedChild?._id}_${practiceId}_${today}`;
-      const next = { ...prev, [childKey]: !prev[childKey] };
-      localStorage.setItem('vschool_home_practices', JSON.stringify(next));
-      return next;
-    });
-  };
-
-  const achievedCount = allMilestones.filter(m => m.status === 'achieved').length;
-  const inProgressCount = allMilestones.filter(m => m.status === 'in_progress').length;
-  const progressPct = allMilestones.length > 0
-    ? Math.round((achievedCount / allMilestones.length) * 100)
-    : 0;
-
-  if (loading) {
-    return (
-      <DashboardLayout>
-        <div className="loading-screen">
-          <div className="spinner spinner-lg"></div>
-          <p className="mt-3">Loading developmental milestones &amp; home program...</p>
-        </div>
-      </DashboardLayout>
+  // Latest status per goal, with the trail of earlier ratings
+  const goals = useMemo(() => {
+    const map = new Map();
+    [...shared].reverse().forEach((s) =>
+      s.milestones?.forEach((m) => {
+        const g = map.get(m.goal) || { goal: m.goal, department: s.department, history: [] };
+        g.history.push({ status: m.status, date: s.date });
+        g.status = m.status;
+        g.updated = s.date;
+        map.set(m.goal, g);
+      })
     );
-  }
+    return [...map.values()].sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);
+  }, [shared]);
+
+  // Most recent home plan per therapy
+  const practice = useMemo(() => {
+    const seen = new Set();
+    return shared.filter(
+      (s) => s.homeActivities && !seen.has(s.department) && seen.add(s.department)
+    );
+  }, [shared]);
+
+  if (loading) return <PageSkeleton />;
+
+  const achieved = goals.filter((g) => g.status === 'achieved').length;
+  const today = toDateKey();
+  const week = Array.from({ length: 7 }, (_, i) => addDays(today, i - 6));
+  const tickKey = (s, day) => `${child?._id}:${s.department}:${day}`;
+  const toggle = (s) => {
+    const next = { ...ticks, [tickKey(s, today)]: !ticks[tickKey(s, today)] };
+    setTicks(next);
+    writeTicks(next);
+  };
+  const practisedDays = week.filter((d) => practice.some((s) => ticks[tickKey(s, d)])).length;
 
   return (
-    <DashboardLayout>
-      {/* Header */}
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Child Progress &amp; Developmental Milestones</h1>
-          <p className="page-subtitle">
-            Longitudinal skill mastery, therapist feedback, and home practice exercises.
-          </p>
-        </div>
-      </div>
+    <>
+      <PageHeader
+        title="Progress"
+        description={child ? `${child.name}’s goals, therapist notes and home practice` : undefined}
+        actions={<ChildSwitcher kids={children} child={child} onSelect={selectChild} />}
+      />
 
-      {children.length === 0 ? (
-        <div className="card">
-          <div className="empty-state">
-            <div className="empty-icon">👶</div>
-            <div className="empty-title">No Children Registered</div>
-            <div className="empty-desc">Please contact reception to connect your child to this account.</div>
-          </div>
-        </div>
-      ) : (
-        <>
-          {/* Child Selector Tabs (if multiple children) */}
-          {children.length > 1 && (
-            <div className="flex gap-2 mb-4">
-              {children.map(c => (
-                <button
-                  key={c._id}
-                  className={`btn ${selectedChild?._id === c._id ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={() => setSelectedChild(c)}
-                >
-                  {c.gender === 'female' ? '👧' : '👦'} {c.name}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {selectedChild && (
-            <>
-              {/* Child Overview Hero */}
-              <div
-                className="card mb-4"
-                style={{
-                  background: 'linear-gradient(135deg, var(--surface) 0%, var(--primary-light) 100%)',
-                  border: '1px solid rgba(37,99,235,0.2)',
-                  position: 'relative',
-                  overflow: 'hidden',
-                }}
-              >
-                <div className="flex gap-4 items-center flex-wrap">
-                  <div
-                    className="user-avatar-lg"
-                    style={{ width: 68, height: 68, fontSize: '2rem', background: '#fff', boxShadow: 'var(--shadow-sm)' }}
-                  >
-                    {selectedChild.gender === 'female' ? '👧' : '👦'}
-                  </div>
-                  <div className="flex-1" style={{ minWidth: 220 }}>
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-xl font-bold text-primary">{selectedChild.name}</h2>
-                      <span className="badge" style={{ background: 'var(--surface)', color: 'var(--text-secondary)' }}>
-                        Age {selectedChild.age} • {selectedChild.gender}
-                      </span>
-                    </div>
-                    {selectedChild.diagnosis && (
-                      <div className="text-xs font-semibold text-secondary mt-1">
-                        Diagnosis: <strong>{selectedChild.diagnosis}</strong>
-                      </div>
-                    )}
-                    <div className="flex gap-1 mt-2 flex-wrap">
-                      {selectedChild.enrolledDepartments?.map(d => (
-                        <span
-                          key={d}
-                          className="dept-chip"
-                          style={{ background: `${getDeptColor(d)}18`, color: getDeptColor(d) }}
-                        >
-                          {getDeptLabel(d)}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Overall Milestone Score */}
-                  <div
-                    className="card-compact"
-                    style={{
-                      background: 'var(--surface)',
-                      padding: '1rem 1.25rem',
-                      borderRadius: 'var(--r-lg)',
-                      boxShadow: 'var(--shadow-xs)',
-                      textAlign: 'center',
-                      minWidth: 160,
-                    }}
-                  >
-                    <div className="text-xs font-bold text-muted uppercase">Milestones Mastered</div>
-                    <div className="text-3xl font-extrabold text-primary mt-1">
-                      {achievedCount} <span className="text-base text-muted font-normal">/ {allMilestones.length || 0}</span>
-                    </div>
-                    <div className="progress-bar mt-2" style={{ height: 6 }}>
-                      <div
-                        className="progress-fill"
-                        style={{ width: `${progressPct}%`, background: 'var(--emerald)' }}
-                      />
-                    </div>
-                    <div className="text-xs text-emerald-600 font-semibold mt-1">
-                      {progressPct}% Skill Progression
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className="grid-2" style={{ gridTemplateColumns: '1.4fr 1fr' }}>
-                {/* Left Column: Targeted Milestones & Clinical Feed */}
-                <div className="flex" style={{ flexDirection: 'column', gap: '1.25rem' }}>
-                  {/* Milestones Card */}
-                  <div className="card">
-                    <div className="card-header flex justify-between items-center">
-                      <div>
-                        <h3 className="section-title">Longitudinal Skill Goals</h3>
-                        <div className="text-xs text-muted mt-1">
-                          Evaluated by therapists during clinical sessions
-                        </div>
-                      </div>
-                      <span className="badge" style={{ background: 'var(--surface-2)', color: 'var(--text-secondary)' }}>
-                        {achievedCount} Achieved • {inProgressCount} In Progress
-                      </span>
-                    </div>
-
-                    {allMilestones.length === 0 ? (
-                      <div className="empty-state" style={{ padding: '2rem 1rem' }}>
-                        <div className="empty-icon">🎯</div>
-                        <div className="empty-title">Goals Being Formulated</div>
-                        <div className="empty-desc">
-                          Therapists will record and track specific developmental targets during upcoming sessions.
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="flex" style={{ flexDirection: 'column', gap: '0.65rem' }}>
-                        {allMilestones.map((m, idx) => {
-                          const deptColor = getDeptColor(m.department);
-                          const isAchieved = m.status === 'achieved';
-                          return (
-                            <div
-                              key={idx}
-                              className="milestone-row"
-                              style={{
-                                background: isAchieved ? 'var(--success-bg)' : 'var(--surface)',
-                                borderColor: isAchieved ? '#bbf7d0' : 'var(--border)',
-                              }}
-                            >
-                              <div className="flex items-center gap-2 flex-1">
-                                <span style={{ fontSize: '1rem' }}>
-                                  {isAchieved ? '✅' : '🔄'}
-                                </span>
-                                <div>
-                                  <div className="text-sm font-semibold text-primary">{m.goal}</div>
-                                  <div className="text-xs text-muted mt-0.5">
-                                    <span style={{ color: deptColor, fontWeight: 600 }}>
-                                      {getDeptLabel(m.department)}
-                                    </span>
-                                  </div>
-                                </div>
-                              </div>
-
-                              <span
-                                className="badge"
-                                style={{
-                                  fontSize: '0.725rem',
-                                  background: isAchieved ? '#dcfce7' : 'var(--surface-3)',
-                                  color: isAchieved ? '#16a34a' : 'var(--text-secondary)',
-                                  border: isAchieved ? '1px solid #86efac' : '1px solid var(--border)',
-                                }}
-                              >
-                                {isAchieved ? 'Goal Mastered' : 'In Progress'}
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Shared Session Notes Feed */}
-                  <div className="card">
-                    <div className="card-header">
-                      <h3 className="section-title">Therapist Notes &amp; Session Highlights</h3>
-                      <p className="text-xs text-muted mt-1">Observations shared by the clinical care team</p>
-                    </div>
-
-                    {childAppts.length === 0 ? (
-                      <div className="empty-state">
-                        <div className="empty-icon">📝</div>
-                        <div className="empty-title">No Notes Published Yet</div>
-                        <div className="empty-desc">Notes will appear here after sessions are completed.</div>
-                      </div>
-                    ) : (
-                      <div className="flex" style={{ flexDirection: 'column', gap: '1rem' }}>
-                        {childAppts.map(a => {
-                          const deptColor = getDeptColor(a.department);
-                          return (
-                            <div
-                              key={a._id}
-                              className="card-compact"
-                              style={{
-                                borderLeft: `4px solid ${deptColor}`,
-                                background: 'var(--surface)',
-                                boxShadow: 'var(--shadow-xs)',
-                              }}
-                            >
-                              <div className="flex justify-between items-center mb-2">
-                                <div className="flex items-center gap-2">
-                                  <span
-                                    className="dept-chip"
-                                    style={{ background: `${deptColor}15`, color: deptColor }}
-                                  >
-                                    {getDeptLabel(a.department)}
-                                  </span>
-                                  <span className="text-xs font-semibold text-secondary">
-                                    Dr. {a.therapist?.name}
-                                  </span>
-                                </div>
-                                <span className="text-xs text-muted">
-                                  {new Date(a.date).toLocaleDateString('en-IN', {
-                                    day: 'numeric',
-                                    month: 'short',
-                                    year: 'numeric',
-                                  })}
-                                </span>
-                              </div>
-
-                              <div className="text-sm text-secondary mb-2" style={{ lineHeight: 1.6 }}>
-                                {a.soapNotes?.assessment ? (
-                                  <div>
-                                    <strong>Session Summary: </strong>
-                                    {a.soapNotes.assessment}
-                                    {a.soapNotes.plan && (
-                                      <div className="mt-1 text-xs text-muted">
-                                        <strong>Next Focus: </strong> {a.soapNotes.plan}
-                                      </div>
-                                    )}
-                                  </div>
-                                ) : (
-                                  a.sessionNotes
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Right Column: Home Practice & Care Team */}
-                <div className="flex" style={{ flexDirection: 'column', gap: '1.25rem' }}>
-                  {/* Home Exercise & Practice Checklist */}
-                  <div className="card">
-                    <div className="card-header">
-                      <h3 className="section-title">🏡 Daily Home Program</h3>
-                      <div className="text-xs text-muted mt-1">Recommended daily exercises for home practice</div>
-                    </div>
-
-                    {homeActivitiesList.length === 0 ? (
-                      <div className="empty-state" style={{ padding: '2rem 1rem' }}>
-                        <div className="empty-icon">🧸</div>
-                        <div className="empty-title">All Caught Up!</div>
-                        <div className="empty-desc">Your therapist will prescribe home activities during sessions.</div>
-                      </div>
-                    ) : (
-                      <div className="flex" style={{ flexDirection: 'column', gap: '0.75rem' }}>
-                        <div className="card-compact" style={{ background: 'var(--primary-light)', color: 'var(--primary)', fontSize: '0.75rem' }}>
-                          💡 <strong>Tip:</strong> 10-15 minutes of structured play each day dramatically accelerates child skill retention!
-                        </div>
-
-                        {homeActivitiesList.map(item => {
-                          const today = new Date().toISOString().split('T')[0];
-                          const practiceKey = `${selectedChild?._id}_${item.id}_${today}`;
-                          const isDoneToday = Boolean(completedPractices[practiceKey]);
-
-                          return (
-                            <div
-                              key={item.id}
-                              className="card-compact"
-                              style={{
-                                background: isDoneToday ? 'var(--success-bg)' : 'var(--surface-2)',
-                                border: isDoneToday ? '1px solid #86efac' : '1px solid var(--border)',
-                                transition: 'all 0.15s ease',
-                              }}
-                            >
-                              <div className="flex justify-between items-start mb-2">
-                                <span
-                                  className="dept-chip"
-                                  style={{
-                                    background: `${getDeptColor(item.department)}15`,
-                                    color: getDeptColor(item.department),
-                                    fontSize: '0.675rem',
-                                  }}
-                                >
-                                  {getDeptLabel(item.department).split(' ')[0]} • Dr. {item.therapist}
-                                </span>
-
-                                <label
-                                  className="flex items-center gap-1.5"
-                                  style={{ cursor: 'pointer' }}
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={isDoneToday}
-                                    onChange={() => handleTogglePractice(item.id)}
-                                    style={{ accentColor: 'var(--success)', width: 16, height: 16 }}
-                                  />
-                                  <span
-                                    className="text-xs font-bold"
-                                    style={{ color: isDoneToday ? 'var(--success)' : 'var(--text-muted)' }}
-                                  >
-                                    {isDoneToday ? 'Done Today! 🎉' : 'Mark Done'}
-                                  </span>
-                                </label>
-                              </div>
-
-                              <p className="text-xs text-primary font-medium" style={{ whiteSpace: 'pre-line' }}>
-                                {item.text}
-                              </p>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Care Team Quick Contacts */}
-                  <div className="card">
-                    <div className="card-header">
-                      <h3 className="section-title">🩺 Care Team Specialists</h3>
-                    </div>
-
-                    {selectedChild.assignedTherapists?.length === 0 ? (
-                      <div className="text-xs text-muted">No therapists assigned yet.</div>
-                    ) : (
-                      <div className="flex" style={{ flexDirection: 'column', gap: '0.6rem' }}>
-                        {selectedChild.assignedTherapists.map(t => (
-                          <div key={t._id} className="card-compact flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                              <div className="user-avatar" style={{ background: 'var(--primary-light)', color: 'var(--primary)' }}>
-                                {t.name?.[0]}
-                              </div>
-                              <div>
-                                <div className="font-semibold text-xs text-primary">{t.name}</div>
-                                <div className="text-xs text-muted">
-                                  {t.departments?.map(d => getDeptLabel(d).split(' ')[0]).join(', ')}
-                                </div>
-                              </div>
-                            </div>
-                            {t.phone && (
-                              <a
-                                href={`tel:${t.phone}`}
-                                className="btn btn-ghost btn-sm"
-                                style={{ fontSize: '0.725rem', padding: '0.2rem 0.5rem' }}
-                              >
-                                📞 Call
-                              </a>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-        </>
+      {error && (
+        <Alert tone="danger" className="mb-4">
+          {error}
+        </Alert>
       )}
-    </DashboardLayout>
+
+      {!child ? (
+        <Card>
+          <EmptyState
+            icon={Baby}
+            title="No child linked yet"
+            description="Please ask the clinic reception to link your child’s profile."
+          />
+        </Card>
+      ) : (
+        <div className="space-y-6">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <Stat
+              label="Goals achieved"
+              icon={Trophy}
+              accent="var(--success)"
+              value={`${achieved} / ${goals.length}`}
+            >
+              <Progress
+                value={pct(achieved, goals.length)}
+                color="var(--success)"
+                className="mt-2"
+              />
+            </Stat>
+            <Stat label="Goals in progress" icon={Target} value={goals.length - achieved} />
+            <Stat
+              label="Sessions with notes"
+              icon={MessageSquareText}
+              value={shared.length}
+              hint={shared[0] ? `Latest ${formatDate(shared[0].date)}` : undefined}
+            />
+            <Stat label="Practised this week" icon={Home} value={`${practisedDays} / 7 days`} />
+          </div>
+
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+            <Card>
+              <CardHeader
+                title="Goals"
+                description="What the therapists are working on, and how it’s going"
+              />
+              {goals.length === 0 ? (
+                <EmptyState
+                  icon={Target}
+                  title="Goals coming soon"
+                  description="Therapists add goals as they get to know your child."
+                />
+              ) : (
+                goals.map((g) => (
+                  <div key={g.goal} className="list-row items-start">
+                    <span
+                      className={cx(
+                        'mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full',
+                        g.status === 'achieved' ? 'bg-success text-white' : 'border-2'
+                      )}
+                      style={
+                        g.status === 'achieved'
+                          ? undefined
+                          : { borderColor: getDeptColor(g.department) }
+                      }
+                      aria-hidden="true"
+                    >
+                      {g.status === 'achieved' && <Check size={14} strokeWidth={3} />}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-fg">{g.goal}</div>
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
+                        <DeptChip dept={g.department} />
+                        <span>
+                          Updated {formatDate(g.updated, { day: 'numeric', month: 'short' })}
+                        </span>
+                        {g.history.length > 1 && (
+                          <span>
+                            ·{' '}
+                            {g.history.map((h) => MILESTONE_STATUSES[h.status]?.label).join(' → ')}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <Badge tone={MILESTONE_STATUSES[g.status]?.tone} dot>
+                      {MILESTONE_STATUSES[g.status]?.label}
+                    </Badge>
+                  </div>
+                ))
+              )}
+            </Card>
+
+            <Card id="home">
+              <CardHeader
+                title="Home practice"
+                description="Tick off each activity when you’ve done it today"
+              />
+              {practice.length === 0 ? (
+                <EmptyState
+                  icon={Home}
+                  title="No activities yet"
+                  description="Your therapist will suggest simple things to practise together."
+                />
+              ) : (
+                <>
+                  {practice.map((s) => {
+                    const done = Boolean(ticks[tickKey(s, today)]);
+                    return (
+                      <label
+                        key={s._id}
+                        className={cx(
+                          'list-row items-start cursor-pointer',
+                          done && 'bg-surface-2'
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4 shrink-0"
+                          checked={done}
+                          onChange={() => toggle(s)}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2 mb-1">
+                            <DeptChip dept={s.department} />
+                            <span className="text-xs text-muted">
+                              {cleanName(s.therapist?.name)}
+                            </span>
+                          </div>
+                          <p
+                            className={cx(
+                              'text-sm whitespace-pre-line',
+                              done ? 'text-muted' : 'text-fg'
+                            )}
+                          >
+                            {s.homeActivities}
+                          </p>
+                        </div>
+                      </label>
+                    );
+                  })}
+                  <div className="px-4 py-3 border-t border-line">
+                    <div className="section-label mb-2">Last 7 days</div>
+                    <div className="flex gap-1.5">
+                      {week.map((d) => {
+                        const any = practice.some((s) => ticks[tickKey(s, d)]);
+                        return (
+                          <div
+                            key={d}
+                            className="flex-1 text-center"
+                            title={`${formatDate(d)}: ${any ? 'practised' : 'not practised'}`}
+                          >
+                            <div
+                              className={cx('h-7 rounded-md', any ? 'bg-success' : 'bg-surface-3')}
+                            />
+                            <div className="text-[11px] text-muted mt-1">
+                              {parseDateKey(d).toLocaleDateString('en-IN', { weekday: 'narrow' })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              )}
+            </Card>
+          </div>
+
+          <Card>
+            <CardHeader
+              title="Notes from sessions"
+              description="Shared by the therapist after each session"
+            />
+            {shared.length === 0 ? (
+              <EmptyState icon={MessageSquareText} title="No notes shared yet" />
+            ) : (
+              <div className="card-body">
+                <div className="timeline">
+                  {shared.map((s) => (
+                    <div key={s._id} className="timeline-item">
+                      <span
+                        className="timeline-marker"
+                        style={{ borderColor: getDeptColor(s.department) }}
+                      />
+                      <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <span className="font-medium text-fg">{formatDate(s.date)}</span>
+                        <DeptChip dept={s.department} />
+                        <span className="text-muted">{cleanName(s.therapist?.name)}</span>
+                      </div>
+                      {(s.soapNotes?.assessment || s.sessionNotes) && (
+                        <p className="mt-1.5 text-fg-2 leading-relaxed whitespace-pre-line">
+                          {s.soapNotes?.assessment || s.sessionNotes}
+                        </p>
+                      )}
+                      {s.soapNotes?.plan && (
+                        <p className="mt-1 text-sm text-muted">
+                          <span className="font-medium text-fg-2">Next: </span>
+                          {s.soapNotes.plan}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+    </>
   );
 };
 

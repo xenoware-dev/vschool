@@ -7,5 +7,5 @@ export const appointmentsApi = {
   update: (id, data) => api.put(`/appointments/${id}`, data),
   addNotes: (id, data) => api.patch(`/appointments/${id}/notes`, data),
   getAvailableSlots: (params) => api.get('/appointments/slots', { params }),
-  getToday: () => api.get('/appointments/today'),
+  getToday: (params) => api.get('/appointments/today', { params }),
 };

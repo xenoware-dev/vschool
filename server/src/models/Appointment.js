@@ -44,9 +44,9 @@ const appointmentSchema = new mongoose.Schema(
     // Pediatric Clinical SOAP Notes
     soapNotes: {
       subjective: { type: String, default: '' }, // Mood, energy, readiness, parent feedback
-      objective:  { type: String, default: '' }, // Specific exercises, sensory tasks, duration
+      objective: { type: String, default: '' }, // Specific exercises, sensory tasks, duration
       assessment: { type: String, default: '' }, // Performance, behavioral compliance, milestones
-      plan:       { type: String, default: '' }, // Next steps, adjustments, homework recommendations
+      plan: { type: String, default: '' }, // Next steps, adjustments, homework recommendations
     },
     // Home recommendations / exercises specifically for parents
     homeActivities: {
@@ -91,11 +91,20 @@ const appointmentSchema = new mongoose.Schema(
 );
 
 // ─── Compound index: prevent double-booking ───────────────────────────────────
-// A therapist cannot have two appointments on the same date + same time slot
-appointmentSchema.index({ therapist: 1, date: 1, timeSlot: 1 }, { unique: true });
+// A therapist cannot have two live appointments on the same date + time slot.
+// Cancelled / no-show sessions are excluded so the slot can be rebooked.
+const liveSession = { partialFilterExpression: { status: 'scheduled' } };
+appointmentSchema.index(
+  { therapist: 1, date: 1, timeSlot: 1 },
+  { unique: true, name: 'therapist_slot_live', ...liveSession }
+);
 
 // Also prevent same patient booked in same slot on same date
-appointmentSchema.index({ patient: 1, date: 1, timeSlot: 1 }, { unique: true });
+appointmentSchema.index(
+  { patient: 1, date: 1, timeSlot: 1 },
+  { unique: true, name: 'patient_slot_live', ...liveSession }
+);
+appointmentSchema.index({ branch: 1, date: 1 });
 
 const Appointment = mongoose.model('Appointment', appointmentSchema);
 export default Appointment;

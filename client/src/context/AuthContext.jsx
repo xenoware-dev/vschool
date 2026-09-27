@@ -37,13 +37,6 @@ export const AuthProvider = ({ children }) => {
     return data;
   };
 
-  const register = async (userData) => {
-    const { data } = await authApi.register(userData);
-    localStorage.setItem('token', data.token);
-    setUser(data);
-    return data;
-  };
-
   const logout = () => {
     localStorage.removeItem('token');
     setUser(null);
@@ -62,7 +55,6 @@ export const AuthProvider = ({ children }) => {
         user,
         loading,
         login,
-        register,
         logout,
         isOwner,
         isAdmin,
