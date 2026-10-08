@@ -1,39 +1,43 @@
-import mongoose from 'mongoose';
-import Payment from '../models/Payment.js';
-import Payout from '../models/Payout.js';
-import Patient from '../models/Patient.js';
-import Appointment from '../models/Appointment.js';
-import User from '../models/User.js';
-import Branch from '../models/Branch.js';
+import prisma from '../config/db.js';
 import {
   addDays,
+  currentPeriod,
+  inCenter,
   monthRange,
-  outsideBranch,
-  sameId,
-  scopedBranch,
+  outsideScope,
+  scopedWhere,
   startOfDay,
-  userBranchId,
 } from '../utils/scope.js';
+import { serializePayment, serializePayout, serializeProfile } from '../utils/serialize.js';
 
-const populatePayment = (query) =>
-  query
-    .populate('patient', 'name studentId parentDetails')
-    .populate('branch', 'name code city address phone')
-    .populate('recordedBy', 'name');
+const CLINICIANS = ['therapist', 'teacher'];
 
-const currentPeriod = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+const PAYMENT_INCLUDE = {
+  patient: {
+    select: {
+      id: true,
+      name: true,
+      studentId: true,
+      parentName: true,
+      parentPhone: true,
+      parentEmail: true,
+      parentRelationship: true,
+      parentAddress: true,
+    },
+  },
+  branch: { select: { id: true, name: true, code: true, city: true, address: true, phone: true } },
+  recordedBy: { select: { id: true, name: true } },
 };
 
 // Next receipt number for a branch, e.g. BR001-2026-0007
 const nextReceiptNo = async (branchId) => {
-  const branch = await Branch.findById(branchId).select('code');
-  const year = new Date().getFullYear();
-  const prefix = `${branch?.code || 'BR'}-${year}-`;
-  const last = await Payment.findOne({ branch: branchId, receiptNo: { $regex: `^${prefix}` } })
-    .sort({ receiptNo: -1 })
-    .select('receiptNo');
+  const branch = await prisma.branch.findUnique({ where: { id: branchId }, select: { code: true } });
+  const prefix = `${branch?.code || 'BR'}-${new Date().getFullYear()}-`;
+  const last = await prisma.payment.findFirst({
+    where: { branchId, receiptNo: { startsWith: prefix } },
+    orderBy: { receiptNo: 'desc' },
+    select: { receiptNo: true },
+  });
   const seq = last ? Number(last.receiptNo.slice(prefix.length)) + 1 : 1;
   return `${prefix}${String(seq).padStart(4, '0')}`;
 };
@@ -43,96 +47,102 @@ const nextReceiptNo = async (branchId) => {
 // @route  GET /api/billing/payments?status=&patient=&from=&to=&branch=
 export const getPayments = async (req, res) => {
   const { status, patient, from, to, branch } = req.query;
-  const filter = {};
+  let where;
 
   if (req.user.role === 'parent') {
-    filter.patient = { $in: req.user.children || [] };
+    where = { ...inCenter(req.user), patient: { parentId: req.user.id } };
   } else {
-    const scoped = scopedBranch(req.user, branch);
-    if (scoped) filter.branch = scoped;
-    if (patient) filter.patient = patient;
+    where = scopedWhere(req.user, branch);
+    if (patient) where.patientId = patient;
   }
-  if (status) filter.status = status;
+  if (status) where.status = status;
   if (from || to) {
-    filter.createdAt = {};
-    if (from) filter.createdAt.$gte = startOfDay(from);
-    if (to) filter.createdAt.$lt = addDays(startOfDay(to), 1);
+    where.createdAt = {
+      ...(from && { gte: startOfDay(from) }),
+      ...(to && { lt: addDays(startOfDay(to), 1) }),
+    };
   }
 
-  const payments = await populatePayment(Payment.find(filter)).sort({ createdAt: -1 });
-  res.json(payments);
+  const payments = await prisma.payment.findMany({
+    where,
+    include: PAYMENT_INCLUDE,
+    orderBy: { createdAt: 'desc' },
+  });
+  res.json(payments.map(serializePayment));
 };
 
 // @route  POST /api/billing/payments
 export const createPayment = async (req, res) => {
-  const branchId = userBranchId(req.user);
+  const branchId = req.user.branchId;
   const { patient, department, description, amount, method, status, dueDate, reference } = req.body;
 
-  const child = await Patient.findById(patient).select('branch');
-  if (!child || !sameId(child.branch, branchId)) {
-    return res.status(404).json({ message: 'Child not found in your branch' });
+  const child = await prisma.patient.findFirst({
+    where: { id: patient, branchId, ...inCenter(req.user) },
+    select: { id: true },
+  });
+  if (!child) return res.status(404).json({ message: 'Child not found in your branch' });
+  if (!description || !(Number(amount) > 0)) {
+    return res.status(400).json({ message: 'Description and an amount above zero are required' });
   }
 
   const isPaid = (status || 'paid') === 'paid';
   // Retry once if two receipts race for the same number
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const payment = await Payment.create({
-        receiptNo: await nextReceiptNo(branchId),
-        branch: branchId,
-        patient,
-        department: department || undefined,
-        description,
-        amount,
-        method,
-        status: isPaid ? 'paid' : 'pending',
-        paidAt: isPaid ? new Date() : null,
-        dueDate: !isPaid && dueDate ? startOfDay(dueDate) : null,
-        reference,
-        recordedBy: req.user._id,
+      const payment = await prisma.payment.create({
+        data: {
+          centerId: req.user.centerId,
+          branchId,
+          receiptNo: await nextReceiptNo(branchId),
+          patientId: child.id,
+          department: department || null,
+          description,
+          amount: Number(amount),
+          ...(method && { method }),
+          status: isPaid ? 'paid' : 'pending',
+          paidAt: isPaid ? new Date() : null,
+          dueDate: !isPaid && dueDate ? startOfDay(dueDate) : null,
+          reference: reference || '',
+          recordedById: req.user.id,
+        },
+        include: PAYMENT_INCLUDE,
       });
-      return res.status(201).json(await populatePayment(Payment.findById(payment._id)));
+      return res.status(201).json(serializePayment(payment));
     } catch (err) {
-      if (err.code !== 11000 || attempt === 1) throw err;
+      if (err.code !== 'P2002' || attempt === 1) throw err;
     }
   }
 };
 
 // @route  PATCH /api/billing/payments/:id   (mark paid / edit details)
 export const updatePayment = async (req, res) => {
-  const payment = await Payment.findById(req.params.id);
-  if (!payment) return res.status(404).json({ message: 'Payment not found' });
-  if (outsideBranch(req.user, payment.branch))
-    return res.status(403).json({ message: 'Access denied' });
+  const payment = await prisma.payment.findUnique({ where: { id: req.params.id } });
+  if (!payment || payment.centerId !== req.user.centerId) {
+    return res.status(404).json({ message: 'Payment not found' });
+  }
+  if (outsideScope(req.user, payment)) return res.status(403).json({ message: 'Access denied' });
 
   const { description, amount, method, status, reference, dueDate } = req.body;
-  if (description !== undefined) payment.description = description;
-  if (amount !== undefined) payment.amount = amount;
-  if (method !== undefined) payment.method = method;
-  if (reference !== undefined) payment.reference = reference;
-  if (dueDate !== undefined) payment.dueDate = dueDate ? startOfDay(dueDate) : null;
+  const data = {};
+  if (description !== undefined) data.description = description;
+  if (amount !== undefined) data.amount = Number(amount);
+  if (method !== undefined) data.method = method;
+  if (reference !== undefined) data.reference = reference;
+  if (dueDate !== undefined) data.dueDate = dueDate ? startOfDay(dueDate) : null;
   if (status && status !== payment.status) {
-    payment.status = status;
-    payment.paidAt = status === 'paid' ? new Date() : null;
+    data.status = status;
+    data.paidAt = status === 'paid' ? new Date() : null;
   }
 
-  await payment.save();
-  res.json(await populatePayment(Payment.findById(payment._id)));
+  const updated = await prisma.payment.update({
+    where: { id: payment.id },
+    data,
+    include: PAYMENT_INCLUDE,
+  });
+  res.json(serializePayment(updated));
 };
 
 // ─── Staff payroll ───────────────────────────────────────────────────────────
-
-// Completed sessions per clinician for a branch + month
-const completedSessionsByStaff = async (branchId, period) => {
-  const { start, end } = monthRange(period);
-  const match = { status: 'completed', date: { $gte: start, $lt: end } };
-  if (branchId) match.branch = new mongoose.Types.ObjectId(String(branchId));
-  const rows = await Appointment.aggregate([
-    { $match: match },
-    { $group: { _id: '$therapist', sessions: { $sum: 1 } } },
-  ]);
-  return Object.fromEntries(rows.map((r) => [r._id.toString(), r.sessions]));
-};
 
 // @route  GET /api/billing/payroll?period=YYYY-MM&branch=
 // One row per therapist/teacher: completed sessions, their rate, and any payout already made
@@ -141,32 +151,47 @@ export const getPayroll = async (req, res) => {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) {
     return res.status(400).json({ message: 'period must be YYYY-MM' });
   }
-  const branchId = scopedBranch(req.user, req.query.branch);
-
-  const staffFilter = { role: { $in: ['therapist', 'teacher'] } };
-  if (branchId) staffFilter.branch = branchId;
+  const where = scopedWhere(req.user, req.query.branch);
+  const { start, end } = monthRange(period);
 
   const [staff, sessions, payouts] = await Promise.all([
-    User.find(staffFilter)
-      .select('name email role departments sessionRate isActive branch')
-      .populate('branch', 'name code')
-      .sort('name'),
-    completedSessionsByStaff(branchId, period),
-    Payout.find({ period, ...(branchId && { branch: branchId }) }).populate('recordedBy', 'name'),
+    prisma.profile.findMany({
+      where: { ...where, role: { in: CLINICIANS } },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        departments: true,
+        sessionRate: true,
+        isActive: true,
+        branchId: true,
+        branch: { select: { id: true, name: true, code: true } },
+      },
+      orderBy: { name: 'asc' },
+    }),
+    prisma.appointment.groupBy({
+      by: ['therapistId'],
+      where: { ...where, status: 'completed', date: { gte: start, lt: end } },
+      _count: { _all: true },
+    }),
+    prisma.payout.findMany({
+      where: { ...where, period },
+      include: { recordedBy: { select: { id: true, name: true } } },
+    }),
   ]);
-
-  const payoutByStaff = Object.fromEntries(payouts.map((p) => [p.staff.toString(), p]));
 
   const rows = staff
     .map((s) => {
-      const completed = sessions[s._id.toString()] || 0;
-      const payout = payoutByStaff[s._id.toString()] || null;
+      const completed = sessions.find((r) => r.therapistId === s.id)?._count._all || 0;
+      const rate = Number(s.sessionRate ?? 0);
+      const payout = payouts.find((p) => p.staffId === s.id);
       return {
-        staff: s,
+        staff: serializeProfile(s),
         completedSessions: completed,
-        ratePerSession: s.sessionRate ?? 0,
-        estimatedAmount: completed * (s.sessionRate ?? 0),
-        payout,
+        ratePerSession: rate,
+        estimatedAmount: completed * rate,
+        payout: payout ? serializePayout(payout) : null,
       };
     })
     // Hide inactive staff with nothing to pay for this month
@@ -177,51 +202,50 @@ export const getPayroll = async (req, res) => {
 
 // @route  POST /api/billing/payouts   (records / updates the payout for a staff member + month)
 export const savePayout = async (req, res) => {
-  const {
-    staff,
-    period,
-    sessions,
-    ratePerSession,
-    bonus = 0,
-    deductions = 0,
-    method,
-    reference,
-  } = req.body;
+  const { staff, period, method, reference } = req.body;
+  const sessions = Number(req.body.sessions) || 0;
+  const ratePerSession = Number(req.body.ratePerSession) || 0;
+  const bonus = Number(req.body.bonus) || 0;
+  const deductions = Number(req.body.deductions) || 0;
 
-  const member = await User.findById(staff).select('role branch');
-  if (
-    !member ||
-    !['therapist', 'teacher'].includes(member.role) ||
-    outsideBranch(req.user, member.branch)
-  ) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period || '')) {
+    return res.status(400).json({ message: 'period must be YYYY-MM' });
+  }
+
+  const member = await prisma.profile.findFirst({
+    where: { id: staff, role: { in: CLINICIANS }, ...inCenter(req.user) },
+  });
+  if (!member || outsideScope(req.user, member)) {
     return res.status(404).json({ message: 'Staff member not found in your branch' });
   }
 
-  const amount = Math.max(
-    0,
-    Number(sessions) * Number(ratePerSession) + Number(bonus) - Number(deductions)
-  );
+  const amount = Math.max(0, sessions * ratePerSession + bonus - deductions);
+  const values = {
+    sessions,
+    ratePerSession,
+    bonus,
+    deductions,
+    amount,
+    ...(method && { method }),
+    reference: reference || '',
+    paidAt: new Date(),
+    recordedById: req.user.id,
+  };
 
-  const payout = await Payout.findOneAndUpdate(
-    { staff, period },
-    {
-      branch: member.branch,
-      staff,
+  const payout = await prisma.payout.upsert({
+    where: { staffId_period: { staffId: member.id, period } },
+    create: {
+      ...values,
+      centerId: req.user.centerId,
+      branchId: member.branchId,
+      staffId: member.id,
       period,
-      sessions,
-      ratePerSession,
-      bonus,
-      deductions,
-      amount,
-      method,
-      reference,
-      paidAt: new Date(),
-      recordedBy: req.user._id,
     },
-    { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
-  ).populate('recordedBy', 'name');
+    update: values,
+    include: { recordedBy: { select: { id: true, name: true } } },
+  });
 
-  res.status(201).json(payout);
+  res.status(201).json(serializePayout(payout));
 };
 
 // ─── Summary (dashboard tiles) ───────────────────────────────────────────────
@@ -229,25 +253,27 @@ export const savePayout = async (req, res) => {
 // @route  GET /api/billing/summary?period=YYYY-MM&branch=
 export const getBillingSummary = async (req, res) => {
   const period = req.query.period || currentPeriod();
-  const branchId = scopedBranch(req.user, req.query.branch);
+  const where = scopedWhere(req.user, req.query.branch);
   const { start, end } = monthRange(period);
-  const branchMatch = branchId ? { branch: new mongoose.Types.ObjectId(String(branchId)) } : {};
 
   const [collected, pending, paidOut] = await Promise.all([
-    Payment.aggregate([
-      { $match: { ...branchMatch, status: 'paid', paidAt: { $gte: start, $lt: end } } },
-      { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
-    ]),
-    Payment.aggregate([
-      { $match: { ...branchMatch, status: 'pending' } },
-      { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
-    ]),
-    Payout.aggregate([
-      { $match: { ...branchMatch, period } },
-      { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
-    ]),
+    prisma.payment.aggregate({
+      where: { ...where, status: 'paid', paidAt: { gte: start, lt: end } },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    prisma.payment.aggregate({
+      where: { ...where, status: 'pending' },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    prisma.payout.aggregate({
+      where: { ...where, period },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
   ]);
 
-  const pick = (rows) => ({ total: rows[0]?.total || 0, count: rows[0]?.count || 0 });
+  const pick = (r) => ({ total: Number(r._sum.amount || 0), count: r._count._all });
   res.json({ period, collected: pick(collected), pending: pick(pending), payouts: pick(paidOut) });
 };

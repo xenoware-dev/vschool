@@ -1,28 +1,22 @@
-import mongoose from 'mongoose';
-import Patient from '../models/Patient.js';
-import User from '../models/User.js';
-import Branch from '../models/Branch.js';
-import { outsideBranch, sameId, scopedBranch, userBranchId } from '../utils/scope.js';
+import { Prisma } from '@prisma/client';
+import prisma from '../config/db.js';
+import { createAccount } from './userController.js';
+import { inCenter, outsideScope, scopedBranch, scopedWhere, startOfDay } from '../utils/scope.js';
+import { serializePatient } from '../utils/serialize.js';
 
-const EDITABLE_FIELDS = [
-  'name',
-  'dateOfBirth',
-  'gender',
-  'categories',
-  'schoolDetails',
-  'parentDetails',
-  'enrolledDepartments',
-  'assignedTherapists',
-  'medicalNotes',
-  'diagnosis',
-  'status',
-];
+const CLINICIANS = ['therapist', 'teacher'];
 
-const populatePatient = (query) =>
-  query
-    .populate('branch', 'name code city')
-    .populate('assignedTherapists', 'name email phone role departments')
-    .populate('parent', 'name email phone isActive');
+const PATIENT_INCLUDE = {
+  branch: { select: { id: true, name: true, code: true, city: true } },
+  assignedTherapists: {
+    include: {
+      therapist: {
+        select: { id: true, name: true, email: true, phone: true, role: true, departments: true },
+      },
+    },
+  },
+  parent: { select: { id: true, name: true, email: true, phone: true, isActive: true } },
+};
 
 class RequestError extends Error {
   constructor(status, message) {
@@ -30,6 +24,45 @@ class RequestError extends Error {
     this.status = status;
   }
 }
+
+// Request body (client shape) → patient columns
+const patientData = (body) => {
+  const data = {};
+  const copy = [
+    'name',
+    'gender',
+    'categories',
+    'enrolledDepartments',
+    'medicalNotes',
+    'diagnosis',
+    'status',
+  ];
+  copy.forEach((f) => {
+    if (body[f] !== undefined) data[f] = body[f];
+  });
+  if (body.dateOfBirth) data.dateOfBirth = startOfDay(body.dateOfBirth);
+
+  const school = body.schoolDetails;
+  if (school) {
+    ['grade', 'section', 'rollNo', 'academicYear'].forEach((f) => {
+      if (school[f] !== undefined) data[f] = school[f] ?? '';
+    });
+  }
+  const parent = body.parentDetails;
+  if (parent) {
+    const map = {
+      name: 'parentName',
+      phone: 'parentPhone',
+      email: 'parentEmail',
+      relationship: 'parentRelationship',
+      address: 'parentAddress',
+    };
+    Object.entries(map).forEach(([from, to]) => {
+      if (parent[from] !== undefined) data[to] = parent[from] ?? '';
+    });
+  }
+  return data;
+};
 
 // Works out which parent account (if any) the child should be linked to.
 // body.parent          → link an existing parent account from the same branch
@@ -40,252 +73,262 @@ const resolveParent = async (req, branchId, parentDetails) => {
 
   if (parentAccount?.email) {
     const email = parentAccount.email.toLowerCase().trim();
-    const existing = await User.findOne({ email });
+    const existing = await prisma.profile.findUnique({ where: { email } });
     if (existing) {
-      if (existing.role !== 'parent' || !sameId(existing.branch, branchId)) {
+      if (
+        existing.role !== 'parent' ||
+        existing.centerId !== req.user.centerId ||
+        existing.branchId !== branchId
+      ) {
         throw new RequestError(400, 'That email already belongs to another account');
       }
-      return existing._id;
+      return existing.id;
     }
     if (!parentAccount.password || parentAccount.password.length < 6) {
       throw new RequestError(400, 'Parent portal password must be at least 6 characters');
     }
-    const created = await User.create({
-      name: parentDetails?.name || 'Parent',
+    const created = await createAccount({
       email,
       password: parentAccount.password,
+      centerId: req.user.centerId,
+      branchId,
+      name: parentDetails?.name || 'Parent',
       phone: parentDetails?.phone || '',
       role: 'parent',
-      branch: branchId,
-      createdBy: req.user._id,
+      createdById: req.user.id,
     });
-    return created._id;
+    return created.id;
   }
 
   if (parent === null || parent === '') return null;
   if (parent) {
-    const doc = await User.findById(parent).select('role branch');
-    if (!doc || doc.role !== 'parent' || !sameId(doc.branch, branchId)) {
-      throw new RequestError(404, 'Parent account not found in this branch');
-    }
-    return doc._id;
+    const doc = await prisma.profile.findFirst({
+      where: { id: parent, role: 'parent', branchId, ...inCenter(req.user) },
+    });
+    if (!doc) throw new RequestError(404, 'Parent account not found in this branch');
+    return doc.id;
   }
   return undefined;
 };
 
-// Ensures every assigned therapist is an active clinician of this branch
-const validateTherapists = async (ids, branchId) => {
+// Ensures every assigned therapist is a clinician of this branch
+const validateTherapists = async (req, ids, branchId) => {
   if (!ids?.length) return;
-  const count = await User.countDocuments({
-    _id: { $in: ids },
-    role: { $in: ['therapist', 'teacher'] },
-    branch: branchId,
+  const unique = [...new Set(ids.map(String))];
+  const count = await prisma.profile.count({
+    where: { id: { in: unique }, role: { in: CLINICIANS }, branchId, ...inCenter(req.user) },
   });
-  if (count !== new Set(ids.map(String)).size) {
+  if (count !== unique.length) {
     throw new RequestError(400, 'One or more selected therapists are not part of this branch');
   }
 };
 
-const syncParentChildren = async (patientId, oldParent, newParent) => {
-  if (sameId(oldParent, newParent)) return;
-  if (oldParent) await User.findByIdAndUpdate(oldParent, { $pull: { children: patientId } });
-  if (newParent) await User.findByIdAndUpdate(newParent, { $addToSet: { children: patientId } });
-};
+const therapistLinks = (ids) => [...new Set(ids.map(String))].map((therapistId) => ({ therapistId }));
 
-const sendError = (res, err) => {
-  if (err instanceof RequestError) return res.status(err.status).json({ message: err.message });
+const handle = (res, err) => {
+  if (err instanceof RequestError || err.status) {
+    return res.status(err.status).json({ message: err.message });
+  }
   throw err;
 };
 
-// ─── Register a new patient/student (admin only) ─────────────────────────────
+const loadPatient = (id, extra = {}) =>
+  prisma.patient.findUnique({ where: { id }, include: { ...PATIENT_INCLUDE, ...extra } });
+
+// ─── Register a new child (admin only) ───────────────────────────────────────
 // @route  POST /api/patients
 export const createPatient = async (req, res) => {
-  const branchId = userBranchId(req.user);
+  const branchId = req.user.branchId;
   if (!branchId) {
     return res
       .status(400)
       .json({ message: 'Admin must be assigned to a branch to register children' });
   }
 
-  const branchDoc = await Branch.findById(branchId);
-  const { studentId: customStudentId, parentDetails = {}, assignedTherapists = [] } = req.body;
+  const data = patientData(req.body);
+  if (!data.name || !data.dateOfBirth || !data.gender) {
+    return res.status(400).json({ message: "Child's name, date of birth and gender are required" });
+  }
+
+  const branch = await prisma.branch.findUnique({ where: { id: branchId }, select: { code: true } });
+  const { studentId: customStudentId, assignedTherapists = [] } = req.body;
 
   let parentId;
   try {
-    await validateTherapists(assignedTherapists, branchId);
-    parentId = await resolveParent(req, branchId, parentDetails);
+    await validateTherapists(req, assignedTherapists, branchId);
+    parentId = await resolveParent(req, branchId, req.body.parentDetails);
   } catch (err) {
-    return sendError(res, err);
+    return handle(res, err);
   }
 
   // Generate a readable ID unless one was supplied
   let studentId = customStudentId?.trim()?.toUpperCase();
+  const taken = (sid) => prisma.patient.findFirst({ where: { branchId, studentId: sid } });
   if (!studentId) {
-    const branchCode = branchDoc?.code || 'BR';
-    let seq = (await Patient.countDocuments({ branch: branchId })) + 1;
+    const prefix = branch?.code || 'BR';
+    let seq = (await prisma.patient.count({ where: { branchId } })) + 1;
     do {
-      studentId = `${branchCode}-STU-${String(seq).padStart(4, '0')}`;
+      studentId = `${prefix}-STU-${String(seq).padStart(4, '0')}`;
       seq += 1;
-    } while (await Patient.exists({ branch: branchId, studentId }));
-  } else if (await Patient.exists({ branch: branchId, studentId })) {
+    } while (await taken(studentId));
+  } else if (await taken(studentId)) {
     return res.status(400).json({ message: `Student ID ${studentId} is already in use` });
   }
 
-  const data = Object.fromEntries(
-    EDITABLE_FIELDS.map((f) => [f, req.body[f]]).filter(([, v]) => v !== undefined)
-  );
-
-  const patient = await Patient.create({
-    ...data,
-    studentId,
-    categories: data.categories?.length ? data.categories : ['clinic'],
-    parent: parentId || null,
-    branch: branchId,
-    branchName: branchDoc?.name || '',
-    status: 'active',
-    registeredBy: req.user._id,
+  const patient = await prisma.patient.create({
+    data: {
+      ...data,
+      studentId,
+      categories: data.categories?.length ? data.categories : ['clinic'],
+      status: 'active',
+      centerId: req.user.centerId,
+      branchId,
+      parentId: parentId || null,
+      registeredById: req.user.id,
+      assignedTherapists: { create: therapistLinks(assignedTherapists) },
+    },
   });
 
-  await syncParentChildren(patient._id, null, parentId);
-
-  res.status(201).json(await populatePatient(Patient.findById(patient._id)));
+  res.status(201).json(serializePatient(await loadPatient(patient.id)));
 };
 
-// ─── Get patients/students ───────────────────────────────────────────────────
+// ─── Get children ────────────────────────────────────────────────────────────
 // @route  GET /api/patients
-// Owner: all (filterable by branch). Admin: own branch. Therapist: assigned. Parent: own children.
+// Owner: whole center (filterable by branch). Admin: own branch. Therapist: assigned. Parent: own children.
 export const getPatients = async (req, res) => {
   const { branch, department, category, status, search, therapist } = req.query;
-  const filter = {};
   const role = req.user.role;
+  let where;
 
   if (role === 'parent') {
-    filter.parent = req.user._id;
+    where = { ...inCenter(req.user), parentId: req.user.id };
   } else {
-    const scoped = scopedBranch(req.user, branch);
-    if (scoped) filter.branch = scoped;
-    if (['therapist', 'teacher'].includes(role)) filter.assignedTherapists = req.user._id;
-    else if (therapist) filter.assignedTherapists = therapist;
+    where = scopedWhere(req.user, branch);
+    const clinician = CLINICIANS.includes(role) ? req.user.id : therapist;
+    if (clinician) where.assignedTherapists = { some: { therapistId: clinician } };
   }
 
-  if (category) filter.categories = category.toLowerCase();
-  if (department) filter.enrolledDepartments = department;
-  if (status) filter.status = status;
+  if (category) where.categories = { has: category.toLowerCase() };
+  if (department) where.enrolledDepartments = { has: department };
+  if (status) where.status = status;
   if (search) {
-    const rx = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-    filter.$or = [
-      { name: rx },
-      { studentId: rx },
-      { 'parentDetails.name': rx },
-      { 'parentDetails.phone': rx },
+    const contains = { contains: search, mode: 'insensitive' };
+    where.OR = [
+      { name: contains },
+      { studentId: contains },
+      { parentName: contains },
+      { parentPhone: contains },
     ];
   }
 
-  const patients = await populatePatient(Patient.find(filter)).sort({ createdAt: -1 });
-  res.json(patients);
+  const patients = await prisma.patient.findMany({
+    where,
+    include: PATIENT_INCLUDE,
+    orderBy: { createdAt: 'desc' },
+  });
+  res.json(patients.map(serializePatient));
 };
 
-// ─── Get single patient ───────────────────────────────────────────────────────
+// ─── Get single child ────────────────────────────────────────────────────────
 // @route  GET /api/patients/:id
 export const getPatient = async (req, res) => {
-  const patient = await populatePatient(Patient.findById(req.params.id)).populate(
-    'registeredBy',
-    'name email'
-  );
-
-  if (!patient) return res.status(404).json({ message: 'Child not found' });
+  const patient = await loadPatient(req.params.id, {
+    registeredBy: { select: { id: true, name: true, email: true } },
+  });
+  if (!patient || patient.centerId !== req.user.centerId) {
+    return res.status(404).json({ message: 'Child not found' });
+  }
 
   const role = req.user.role;
   if (role === 'parent') {
-    if (!sameId(patient.parent, req.user._id))
-      return res.status(403).json({ message: 'Access denied' });
-  } else if (outsideBranch(req.user, patient.branch)) {
+    if (patient.parentId !== req.user.id) return res.status(403).json({ message: 'Access denied' });
+  } else if (outsideScope(req.user, patient)) {
     return res.status(403).json({ message: 'Access denied' });
   }
   if (
-    ['therapist', 'teacher'].includes(role) &&
-    !patient.assignedTherapists.some((t) => sameId(t, req.user._id))
+    CLINICIANS.includes(role) &&
+    !patient.assignedTherapists.some((a) => a.therapistId === req.user.id)
   ) {
     return res.status(403).json({ message: 'Access denied — this child is not assigned to you' });
   }
 
-  res.json(patient);
+  res.json(serializePatient(patient));
 };
 
-// ─── Update patient ───────────────────────────────────────────────────────────
+// ─── Update child ────────────────────────────────────────────────────────────
 // @route  PUT /api/patients/:id
 export const updatePatient = async (req, res) => {
-  const patient = await Patient.findById(req.params.id);
-  if (!patient) return res.status(404).json({ message: 'Child not found' });
-  if (outsideBranch(req.user, patient.branch)) {
-    return res.status(403).json({ message: 'Access denied' });
+  const patient = await prisma.patient.findUnique({ where: { id: req.params.id } });
+  if (!patient || patient.centerId !== req.user.centerId) {
+    return res.status(404).json({ message: 'Child not found' });
   }
+  if (outsideScope(req.user, patient)) return res.status(403).json({ message: 'Access denied' });
 
+  const { assignedTherapists } = req.body;
   let parentId;
   try {
-    if (req.body.assignedTherapists)
-      await validateTherapists(req.body.assignedTherapists, patient.branch);
-    parentId = await resolveParent(
-      req,
-      patient.branch,
-      req.body.parentDetails || patient.parentDetails
-    );
+    if (assignedTherapists) await validateTherapists(req, assignedTherapists, patient.branchId);
+    parentId = await resolveParent(req, patient.branchId, {
+      name: req.body.parentDetails?.name ?? patient.parentName,
+      phone: req.body.parentDetails?.phone ?? patient.parentPhone,
+    });
   } catch (err) {
-    return sendError(res, err);
+    return handle(res, err);
   }
 
-  EDITABLE_FIELDS.forEach((field) => {
-    if (req.body[field] !== undefined) patient[field] = req.body[field];
+  const data = patientData(req.body);
+  if (parentId !== undefined) data.parentId = parentId;
+
+  await prisma.$transaction(async (tx) => {
+    await tx.patient.update({ where: { id: patient.id }, data });
+    if (assignedTherapists) {
+      await tx.patientTherapist.deleteMany({ where: { patientId: patient.id } });
+      await tx.patientTherapist.createMany({
+        data: therapistLinks(assignedTherapists).map((l) => ({ ...l, patientId: patient.id })),
+      });
+    }
   });
 
-  const oldParent = patient.parent;
-  if (parentId !== undefined) patient.parent = parentId;
-
-  await patient.save();
-  if (parentId !== undefined) await syncParentChildren(patient._id, oldParent, parentId);
-
-  res.json(await populatePatient(Patient.findById(patient._id)));
+  res.json(serializePatient(await loadPatient(patient.id)));
 };
 
-// ─── Discharge patient ────────────────────────────────────────────────────────
+// ─── Discharge child ─────────────────────────────────────────────────────────
 // @route  PATCH /api/patients/:id/discharge
 export const dischargePatient = async (req, res) => {
-  const patient = await Patient.findById(req.params.id);
-  if (!patient) return res.status(404).json({ message: 'Child not found' });
-  if (outsideBranch(req.user, patient.branch)) {
-    return res.status(403).json({ message: 'Access denied' });
+  const patient = await prisma.patient.findUnique({ where: { id: req.params.id } });
+  if (!patient || patient.centerId !== req.user.centerId) {
+    return res.status(404).json({ message: 'Child not found' });
   }
-  patient.status = 'discharged';
-  await patient.save();
-  res.json({ message: `${patient.name} discharged`, patient });
+  if (outsideScope(req.user, patient)) return res.status(403).json({ message: 'Access denied' });
+
+  const updated = await prisma.patient.update({
+    where: { id: patient.id },
+    data: { status: 'discharged' },
+  });
+  res.json({ message: `${updated.name} discharged`, patient: serializePatient(updated) });
 };
 
-// ─── Get patient stats for a branch (used by dashboards) ─────────────────────
+// ─── Child stats for dashboards ──────────────────────────────────────────────
 // @route  GET /api/patients/stats
 export const getPatientStats = async (req, res) => {
+  const where = scopedWhere(req.user, req.query.branch);
   const branchId = scopedBranch(req.user, req.query.branch);
-  const filter = branchId ? { branch: branchId } : {};
-  // Aggregation pipelines do not auto-cast ids
-  const match = branchId ? { branch: new mongoose.Types.ObjectId(String(branchId)) } : {};
+  const branchSql = branchId ? Prisma.sql`AND branch_id = ${branchId}::uuid` : Prisma.empty;
 
-  const [total, active, onHold, discharged, byDept, byCat] = await Promise.all([
-    Patient.countDocuments(filter),
-    Patient.countDocuments({ ...filter, status: 'active' }),
-    Patient.countDocuments({ ...filter, status: 'on_hold' }),
-    Patient.countDocuments({ ...filter, status: 'discharged' }),
-    Patient.aggregate([
-      { $match: { ...match, status: 'active' } },
-      { $unwind: '$enrolledDepartments' },
-      { $group: { _id: '$enrolledDepartments', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
-    Patient.aggregate([
-      { $match: { ...match, status: 'active' } },
-      { $unwind: '$categories' },
-      { $group: { _id: '$categories', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
+  const countBy = (column) => prisma.$queryRaw`
+    SELECT value::text AS "_id", COUNT(*)::int AS count
+    FROM patients, unnest(${Prisma.raw(column)}) AS value
+    WHERE center_id = ${req.user.centerId}::uuid AND status = 'active' ${branchSql}
+    GROUP BY value ORDER BY count DESC`;
+
+  const [total, active, onHold, discharged, byDepartment, byCategory] = await Promise.all([
+    prisma.patient.count({ where }),
+    prisma.patient.count({ where: { ...where, status: 'active' } }),
+    prisma.patient.count({ where: { ...where, status: 'on_hold' } }),
+    prisma.patient.count({ where: { ...where, status: 'discharged' } }),
+    countBy('enrolled_departments'),
+    countBy('categories'),
   ]);
 
-  res.json({ total, active, onHold, discharged, byDepartment: byDept, byCategory: byCat });
+  res.json({ total, active, onHold, discharged, byDepartment, byCategory });
 };

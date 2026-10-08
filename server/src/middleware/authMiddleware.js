@@ -1,36 +1,44 @@
-import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import prisma from '../config/db.js';
+import supabase from '../config/supabase.js';
 
-// ─── Protect: Verify JWT and attach user to req ───────────────────────────────
+// ─── Protect: verify the Supabase access token and load the user's profile ───
 export const protect = async (req, res, next) => {
-  let token;
-
-  if (req.headers.authorization?.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  }
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
 
   if (!token) {
     return res.status(401).json({ message: 'Not authorized — no token provided' });
   }
 
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = await User.findById(decoded.id).select('-password').populate('branch', 'name code city');
-    if (!req.user) {
-      return res.status(401).json({ message: 'Not authorized — user not found' });
-    }
-    if (!req.user.isActive) {
-      return res.status(403).json({ message: 'Your account has been deactivated. Contact the clinic owner.' });
-    }
-    next();
-  } catch {
+  // getClaims verifies the token signature (locally, using the project's
+  // published signing keys) and its expiry
+  const { data, error } = await supabase.auth.getClaims(token);
+  const userId = data?.claims?.sub;
+  if (error || !userId) {
     return res.status(401).json({ message: 'Not authorized — token invalid or expired' });
   }
+
+  const profile = await prisma.profile.findUnique({
+    where: { id: userId },
+    include: { branch: { select: { id: true, name: true, code: true, city: true, isActive: true } } },
+  });
+  if (!profile) {
+    return res.status(401).json({ message: 'Not authorized — user not found' });
+  }
+  if (!profile.isActive) {
+    return res
+      .status(403)
+      .json({ message: 'Your account has been deactivated. Contact the clinic owner.' });
+  }
+
+  req.user = profile;
+  next();
 };
 
-// ─── Authorize: Role-based access control ────────────────────────────────────
+// ─── Authorize: role-based access control ────────────────────────────────────
 // Usage: authorize('owner', 'admin')
-export const authorize = (...roles) =>
+export const authorize =
+  (...roles) =>
   (req, res, next) => {
     if (!roles.includes(req.user.role)) {
       return res.status(403).json({
@@ -39,18 +47,3 @@ export const authorize = (...roles) =>
     }
     next();
   };
-
-// ─── Branch Isolation: Ensure admin/therapist only access their branch ────────
-// Owner bypasses. For other roles, branchId in params/body must match req.user.branch
-export const branchIsolation = (req, res, next) => {
-  if (req.user.role === 'owner') return next(); // owner sees all
-
-  const branchId = req.params.branchId || req.body.branch || req.query.branch;
-
-  if (branchId && req.user.branch?._id?.toString() !== branchId.toString()) {
-    return res.status(403).json({
-      message: 'Access denied — you can only access data within your assigned branch',
-    });
-  }
-  next();
-};
