@@ -7,10 +7,29 @@ const api = axios.create({
   },
 });
 
-// Request interceptor — attach JWT token if present
+// ─── Session storage ─────────────────────────────────────────────────────────
+// Access tokens are short-lived (1 hour); the refresh token gets a new one.
+export const session = {
+  get token() {
+    return localStorage.getItem('token');
+  },
+  get refreshToken() {
+    return localStorage.getItem('refreshToken');
+  },
+  save({ token, refreshToken }) {
+    if (token) localStorage.setItem('token', token);
+    if (refreshToken) localStorage.setItem('refreshToken', refreshToken);
+  },
+  clear() {
+    localStorage.removeItem('token');
+    localStorage.removeItem('refreshToken');
+  },
+};
+
+// Request interceptor — attach the access token if present
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('token');
+    const token = session.token;
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -19,16 +38,45 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
-// Response interceptor — an expired/invalid session sends the user back to sign in.
-// A failed sign-in attempt is also a 401, but must stay on the page to show its message.
+// One refresh at a time, shared by every request that hit an expired token
+let refreshing = null;
+const refreshSession = () => {
+  refreshing ??= axios
+    .post('/api/auth/refresh', { refreshToken: session.refreshToken })
+    .then(({ data }) => session.save(data))
+    .finally(() => {
+      refreshing = null;
+    });
+  return refreshing;
+};
+
+const signOut = () => {
+  session.clear();
+  if (window.location.pathname !== '/login') window.location.href = '/login';
+};
+
+// Response interceptor — an expired token is refreshed once and the request
+// retried; if that fails the user goes back to sign in. A failed sign-in
+// attempt is also a 401, but must stay on the page to show its message.
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
-    const isLoginAttempt = error.config?.url?.includes('/auth/login');
-    if (error.response?.status === 401 && !isLoginAttempt) {
-      localStorage.removeItem('token');
-      if (window.location.pathname !== '/login') window.location.href = '/login';
+  async (error) => {
+    const { config, response } = error;
+    const isAuthCall = /\/auth\/(login|refresh)/.test(config?.url || '');
+
+    if (response?.status !== 401 || isAuthCall) return Promise.reject(error);
+
+    if (!config._retried && session.refreshToken) {
+      try {
+        await refreshSession();
+        config._retried = true;
+        config.headers.Authorization = `Bearer ${session.token}`;
+        return api(config);
+      } catch {
+        // fall through to sign-out
+      }
     }
+    signOut();
     return Promise.reject(error);
   }
 );

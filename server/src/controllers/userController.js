@@ -1,6 +1,7 @@
-import User from '../models/User.js';
-import Branch from '../models/Branch.js';
-import { outsideBranch, sameId, scopedBranch, userBranchId } from '../utils/scope.js';
+import prisma from '../config/db.js';
+import supabase from '../config/supabase.js';
+import { inCenter, scopedWhere, userBranchId } from '../utils/scope.js';
+import { serializeProfile } from '../utils/serialize.js';
 
 // Roles each manager role may create / manage
 const MANAGEABLE = {
@@ -8,102 +9,140 @@ const MANAGEABLE = {
   admin: ['therapist', 'teacher', 'parent'],
 };
 const BRANCH_ROLES = ['admin', 'therapist', 'teacher'];
+const CLINICIANS = ['therapist', 'teacher'];
 
-const populateUser = (query) =>
-  query
-    .populate('branch', 'name code city')
-    .populate('children', 'name studentId')
-    .select('-password');
+const PROFILE_INCLUDE = {
+  branch: { select: { id: true, name: true, code: true, city: true } },
+  children: { select: { id: true, name: true, studentId: true } },
+};
+
+const loadProfile = (id) => prisma.profile.findUnique({ where: { id }, include: PROFILE_INCLUDE });
+
+const branchInCenter = (user, branchId) =>
+  prisma.branch.findFirst({ where: { id: branchId, ...inCenter(user) }, select: { id: true } });
 
 // Loads the target user and checks the requester may manage them
 const loadManageable = async (req, res) => {
-  const user = await User.findById(req.params.id);
+  const user = await prisma.profile.findFirst({
+    where: { id: req.params.id, ...inCenter(req.user) },
+  });
   if (!user) {
     res.status(404).json({ message: 'User not found' });
     return null;
   }
-  if (!MANAGEABLE[req.user.role]?.includes(user.role) || outsideBranch(req.user, user.branch)) {
+  const outsideBranch = req.user.role !== 'owner' && user.branchId !== req.user.branchId;
+  if (!MANAGEABLE[req.user.role]?.includes(user.role) || outsideBranch) {
     res.status(403).json({ message: 'You do not have permission to manage this account' });
     return null;
   }
   return user;
 };
 
-// ─── Create user (owner creates admin/therapist/teacher; admin creates therapist/teacher/parent) ─
+// Creates the Supabase Auth login and its profile together; if the profile
+// cannot be saved the login is removed again so no orphan account remains.
+export const createAccount = async ({ email, password, ...profile }) => {
+  const { data, error } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+  });
+  if (error) {
+    const err = new Error(
+      /already been registered|already exists/i.test(error.message)
+        ? 'An account with this email already exists'
+        : error.message
+    );
+    err.status = 400;
+    throw err;
+  }
+  try {
+    return await prisma.profile.create({ data: { id: data.user.id, email, ...profile } });
+  } catch (err) {
+    await supabase.auth.admin.deleteUser(data.user.id);
+    throw err;
+  }
+};
+
+// ─── Create user (owner creates admin/therapist/teacher/parent; admin creates therapist/teacher/parent) ─
 // @route  POST /api/users
 export const createUser = async (req, res) => {
-  const { name, email, password, role, departments, phone, sessionRate } = req.body;
+  const { name, password, role, departments, phone, sessionRate } = req.body;
+  const email = req.body.email?.toLowerCase().trim();
 
   if (!MANAGEABLE[req.user.role]?.includes(role)) {
     return res
       .status(403)
       .json({ message: `You cannot create ${role || 'this type of'} accounts` });
   }
+  if (!name || !email || !password || password.length < 6) {
+    return res
+      .status(400)
+      .json({ message: 'Name, email and a password of at least 6 characters are required' });
+  }
 
   // Admins always create inside their own branch
-  const branch = req.user.role === 'admin' ? userBranchId(req.user) : req.body.branch || null;
+  const branchId = req.user.role === 'admin' ? userBranchId(req.user) : req.body.branch || null;
 
-  if (BRANCH_ROLES.includes(role) && !branch) {
+  if (BRANCH_ROLES.includes(role) && !branchId) {
     return res.status(400).json({ message: 'Please choose a branch for this staff member' });
   }
-  if (branch && !(await Branch.exists({ _id: branch }))) {
+  if (branchId && !(await branchInCenter(req.user, branchId))) {
     return res.status(404).json({ message: 'Branch not found' });
   }
 
-  if (await User.exists({ email: email?.toLowerCase().trim() })) {
-    return res.status(400).json({ message: 'An account with this email already exists' });
-  }
-
-  const user = await User.create({
-    name,
+  const user = await createAccount({
     email,
     password,
+    centerId: req.user.centerId,
+    branchId,
+    name,
     role,
-    branch,
-    departments: ['therapist', 'teacher'].includes(role) ? departments || [] : [],
+    departments: CLINICIANS.includes(role) ? departments || [] : [],
     phone: phone || '',
-    ...(sessionRate !== undefined && sessionRate !== '' && { sessionRate }),
-    createdBy: req.user._id,
+    ...(sessionRate !== undefined && sessionRate !== '' && { sessionRate: Number(sessionRate) }),
+    createdById: req.user.id,
   });
 
-  res.status(201).json(await populateUser(User.findById(user._id)));
+  res.status(201).json(serializeProfile(await loadProfile(user.id)));
 };
 
 // ─── Get users ────────────────────────────────────────────────────────────────
 // @route  GET /api/users?role=&branch=&department=
-// Owner: any user (filterable). Admin: therapists/teachers/parents of their branch.
+// Owner: anyone in the center (filterable). Admin: therapists/teachers/parents of their branch.
 export const getUsers = async (req, res) => {
   const { role, branch, department } = req.query;
-  const filter = {};
-
-  const scoped = scopedBranch(req.user, branch);
-  if (scoped) filter.branch = scoped;
+  const where = scopedWhere(req.user, branch);
 
   const allowed = req.user.role === 'admin' ? MANAGEABLE.admin : null;
   const requested = role ? role.split(',') : null;
   if (allowed) {
-    filter.role = { $in: requested ? requested.filter((r) => allowed.includes(r)) : allowed };
+    where.role = { in: requested ? requested.filter((r) => allowed.includes(r)) : allowed };
   } else if (requested) {
-    filter.role = { $in: requested };
+    where.role = { in: requested };
   }
+  if (department) where.departments = { has: department };
 
-  if (department) filter.departments = { $in: [department] };
-
-  const users = await populateUser(User.find(filter)).sort({ createdAt: -1 });
-  res.json(users);
+  const users = await prisma.profile.findMany({
+    where,
+    include: PROFILE_INCLUDE,
+    orderBy: { createdAt: 'desc' },
+  });
+  res.json(users.map(serializeProfile));
 };
 
 // ─── Get single user ──────────────────────────────────────────────────────────
 // @route  GET /api/users/:id
 export const getUser = async (req, res) => {
-  const user = await populateUser(User.findById(req.params.id));
+  const user = await prisma.profile.findFirst({
+    where: { id: req.params.id, ...inCenter(req.user) },
+    include: PROFILE_INCLUDE,
+  });
   if (!user) return res.status(404).json({ message: 'User not found' });
 
-  if (outsideBranch(req.user, user.branch)) {
+  if (req.user.role !== 'owner' && user.branchId !== req.user.branchId) {
     return res.status(403).json({ message: 'Access denied' });
   }
-
-  res.json(user);
+  res.json(serializeProfile(user));
 };
 
 // ─── Update user ──────────────────────────────────────────────────────────────
@@ -112,48 +151,60 @@ export const updateUser = async (req, res) => {
   const user = await loadManageable(req, res);
   if (!user) return;
 
-  const { name, email, phone, departments, sessionRate } = req.body;
+  const { name, phone, departments, sessionRate } = req.body;
+  const email = req.body.email?.toLowerCase().trim();
+  const data = {};
 
-  if (email && email.toLowerCase().trim() !== user.email) {
-    if (await User.exists({ email: email.toLowerCase().trim(), _id: { $ne: user._id } })) {
-      return res.status(400).json({ message: 'An account with this email already exists' });
+  if (email && email !== user.email) {
+    const { error } = await supabase.auth.admin.updateUserById(user.id, {
+      email,
+      email_confirm: true,
+    });
+    if (error) {
+      return res.status(400).json({
+        message: /already/i.test(error.message)
+          ? 'An account with this email already exists'
+          : error.message,
+      });
     }
-    user.email = email;
+    data.email = email;
   }
-  if (name !== undefined) user.name = name;
-  if (phone !== undefined) user.phone = phone;
-  if (departments !== undefined) user.departments = departments;
-  if (sessionRate !== undefined && sessionRate !== '') user.sessionRate = sessionRate;
+  if (name !== undefined) data.name = name;
+  if (phone !== undefined) data.phone = phone;
+  if (departments !== undefined) data.departments = departments;
+  if (sessionRate !== undefined && sessionRate !== '') data.sessionRate = Number(sessionRate);
 
   // Only the owner may move people between branches or change their role
   if (req.user.role === 'owner') {
-    if (req.body.role && MANAGEABLE.owner.includes(req.body.role)) user.role = req.body.role;
+    if (req.body.role && MANAGEABLE.owner.includes(req.body.role)) data.role = req.body.role;
     if (req.body.branch) {
-      if (!(await Branch.exists({ _id: req.body.branch }))) {
+      if (!(await branchInCenter(req.user, req.body.branch))) {
         return res.status(404).json({ message: 'Branch not found' });
       }
-      user.branch = req.body.branch;
+      data.branchId = req.body.branch;
     }
   }
 
-  await user.save();
-  res.json(await populateUser(User.findById(user._id)));
+  await prisma.profile.update({ where: { id: user.id }, data });
+  res.json(serializeProfile(await loadProfile(user.id)));
 };
 
 // ─── Toggle user active/inactive ─────────────────────────────────────────────
 // @route  PATCH /api/users/:id/toggle
 export const toggleUser = async (req, res) => {
-  if (sameId(req.params.id, req.user._id)) {
+  if (req.params.id === req.user.id) {
     return res.status(400).json({ message: 'You cannot deactivate your own account' });
   }
   const user = await loadManageable(req, res);
   if (!user) return;
 
-  user.isActive = !user.isActive;
-  await user.save();
+  const updated = await prisma.profile.update({
+    where: { id: user.id },
+    data: { isActive: !user.isActive },
+  });
   res.json({
-    message: `${user.name} ${user.isActive ? 'activated' : 'deactivated'}`,
-    isActive: user.isActive,
+    message: `${updated.name} ${updated.isActive ? 'activated' : 'deactivated'}`,
+    isActive: updated.isActive,
   });
 };
 
@@ -167,24 +218,35 @@ export const resetUserPassword = async (req, res) => {
   const user = await loadManageable(req, res);
   if (!user) return;
 
-  user.password = password;
-  await user.save();
+  const { error } = await supabase.auth.admin.updateUserById(user.id, { password });
+  if (error) return res.status(400).json({ message: error.message });
   res.json({ message: `Password reset for ${user.name}` });
 };
 
 // ─── Get therapists for a branch (used by scheduler) ─────────────────────────
 // @route  GET /api/users/therapists
 export const getBranchTherapists = async (req, res) => {
-  const branchId = scopedBranch(req.user, req.query.branch);
-  const { department } = req.query;
+  const where = scopedWhere(req.user, req.query.branch);
+  if (!where.branchId) return res.status(400).json({ message: 'Branch is required' });
 
-  if (!branchId) return res.status(400).json({ message: 'Branch is required' });
-
-  const filter = { role: { $in: ['therapist', 'teacher'] }, branch: branchId, isActive: true };
-  if (department) filter.departments = { $in: [department] };
-
-  const therapists = await User.find(filter)
-    .select('name email phone role departments sessionRate')
-    .sort('name');
-  res.json(therapists);
+  const therapists = await prisma.profile.findMany({
+    where: {
+      ...where,
+      role: { in: CLINICIANS },
+      isActive: true,
+      ...(req.query.department && { departments: { has: req.query.department } }),
+    },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      phone: true,
+      role: true,
+      departments: true,
+      sessionRate: true,
+      branchId: true,
+    },
+    orderBy: { name: 'asc' },
+  });
+  res.json(therapists.map(serializeProfile));
 };

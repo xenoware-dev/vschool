@@ -2,42 +2,32 @@
 // Must have 4 params for Express to treat it as error middleware
 // eslint-disable-next-line no-unused-vars
 const errorHandler = (err, req, res, next) => {
-  let statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  let statusCode = err.status || (res.statusCode === 200 ? 500 : res.statusCode);
   let message = err.message || 'Internal Server Error';
 
-  // Mongoose CastError (invalid ObjectId)
-  if (err.name === 'CastError') {
+  // Prisma: unique constraint
+  if (err.code === 'P2002') {
+    statusCode = 400;
+    const fields = err.meta?.target || err.meta?.driverAdapterError?.cause?.constraint?.fields;
+    message = fields ? `Duplicate value for: ${[].concat(fields).join(', ')}` : 'Duplicate value';
+  }
+
+  // Prisma: record not found, or an id that is not a valid UUID
+  if (err.code === 'P2025' || err.code === 'P2023' || /invalid input syntax for type uuid/i.test(message)) {
     statusCode = 404;
-    message = `Resource not found with id: ${err.value}`;
+    message = 'Resource not found';
   }
 
-  // Mongoose Duplicate Key Error
-  if (err.code === 11000) {
+  // Prisma: bad input (wrong enum value, missing field)
+  if (err.name === 'PrismaClientValidationError') {
     statusCode = 400;
-    const field = Object.keys(err.keyValue)[0];
-    message = `Duplicate value for field: ${field}`;
+    message = 'Invalid request data';
   }
 
-  // Mongoose Validation Error
-  if (err.name === 'ValidationError') {
-    statusCode = 400;
-    message = Object.values(err.errors)
-      .map((e) => e.message)
-      .join(', ');
-  }
-
-  // JWT errors
-  if (err.name === 'JsonWebTokenError') {
-    statusCode = 401;
-    message = 'Invalid token';
-  }
-  if (err.name === 'TokenExpiredError') {
-    statusCode = 401;
-    message = 'Token expired';
-  }
+  if (statusCode >= 500) console.error(err);
 
   res.status(statusCode).json({
-    message,
+    message: statusCode >= 500 && process.env.NODE_ENV === 'production' ? 'Internal Server Error' : message,
     stack: process.env.NODE_ENV === 'production' ? null : err.stack,
   });
 };

@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect } from 'react';
 import { authApi } from '../api/auth';
+import { session } from '../api/axiosInstance';
 
 const AuthContext = createContext(null);
 
@@ -11,8 +12,7 @@ export const AuthProvider = ({ children }) => {
     let isMounted = true;
 
     const loadUser = async () => {
-      const token = localStorage.getItem('token');
-      if (!token) {
+      if (!session.token) {
         if (isMounted) setLoading(false);
         return;
       }
@@ -20,7 +20,7 @@ export const AuthProvider = ({ children }) => {
         const { data } = await authApi.getMe();
         if (isMounted) setUser(data);
       } catch {
-        localStorage.removeItem('token');
+        session.clear();
       } finally {
         if (isMounted) setLoading(false);
       }
@@ -32,13 +32,13 @@ export const AuthProvider = ({ children }) => {
 
   const login = async (credentials) => {
     const { data } = await authApi.login(credentials);
-    localStorage.setItem('token', data.token);
+    session.save(data);
     setUser(data);
     return data;
   };
 
   const logout = () => {
-    localStorage.removeItem('token');
+    session.clear();
     setUser(null);
   };
 
